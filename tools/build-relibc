@@ -10,6 +10,10 @@ set -e
 here=$(cd "$(dirname "$0")/.." && pwd)
 relibc=${RELIBC_DIR:-$here/../relibc}
 channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' "$relibc/rust-toolchain.toml")
+# relibc's toolchain, with rust-src for build-std, installed on first use
+if ! rustup +"$channel" component list --installed 2>/dev/null | grep -q '^rust-src'; then
+	rustup toolchain install "$channel" --profile minimal --component rust-src
+fi
 bin=$(dirname "$(rustup +"$channel" which cargo)")
 
 cd "$relibc"
@@ -26,7 +30,15 @@ cp target/x86_64-unknown-linux-gnu/release/librelibc.a "$here/var/relibc/"
 
 # C headers, as relibc's 'make headers' writes them (cbindgen, see README)
 inc="$here/var/relibc/include"
+# cbindgen: the pinned version, installed into var/tools on first use
+# (CBINDGEN=/path/to/cbindgen uses another one)
+cbindgen_version=0.29.4
 cbindgen=${CBINDGEN:-$here/var/tools/bin/cbindgen}
+if [ -z "$CBINDGEN" ] && [ "$("$cbindgen" --version 2>/dev/null)" != "cbindgen $cbindgen_version" ]; then
+	echo "installing cbindgen $cbindgen_version into var/tools"
+	PATH="$bin:$PATH" cargo install --quiet --locked --force --root "$here/var/tools" \
+		cbindgen --version "$cbindgen_version"
+fi
 rm -rf "$inc" && mkdir -p "$inc"
 cp -r include/* "$inc/"
 cp openlibm/include/*.h openlibm/src/*.h "$inc/"
@@ -39,9 +51,11 @@ for dir in $(find src/header -mindepth 1 -maxdepth 1 -type d -not -name "_*" -no
 	# FreeBSD libc must not take their Linux code paths (see README)
 	cat "src/header/$dir/cbindgen.toml" cbindgen.globdefs.toml \
 		| sed 's/"target_os=linux" = "__linux__"/"target_os=linux" = "__relibc_linux_abi__"/; s/\b__linux__\b/__relibc_linux_abi__/g' \
-		| PATH="$bin:$PATH" "$cbindgen" "src/header/$dir/mod.rs" --config=/dev/stdin --output "$out" 2>/dev/null \
-		|| echo "cbindgen failed for $dir" >&2
+		| PATH="$bin:$PATH" "$cbindgen" "src/header/$dir/mod.rs" --config=/dev/stdin --output "$out" \
+		  2>"$here/var/relibc/cbindgen.log" \
+		|| { cat "$here/var/relibc/cbindgen.log" >&2; echo "error: cbindgen failed for $dir" >&2; exit 1; }
 done
+rm -f "$here/var/relibc/cbindgen.log"
 echo "$inc"
 
 # openlibm, relibc's math library, as relibc's Makefile builds it (and

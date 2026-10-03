@@ -466,6 +466,6 @@ remove ../relibc, run tools/get-relibc and resolve what does not
 apply.
 
 Toolchain: relibc's rust-toolchain.toml (nightly-2026-05-24 with rust-src),
-through rustup, and cbindgen for the headers (var/tools/bin/cbindgen:
-cargo install --root var/tools cbindgen, or CBINDGEN=...). tools/build-relibc calls that toolchain's binaries
+through rustup, and cbindgen for the headers (tools/build-relibc installs
+the pinned version into var/tools; CBINDGEN=... uses another). tools/build-relibc calls that toolchain's binaries
 directly, since the system's cargo and rustc come first on the PATH here.

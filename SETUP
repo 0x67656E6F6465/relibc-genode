@@ -85,20 +85,13 @@ zlib, ...).
   genode/tool/ports/prepare_port nova grub2 lwip linux stdcxx expat
 
 
-5. Rust (for relibc) and cbindgen (for relibc's C headers)
-----------------------------------------------------------
+5. Rust (for relibc)
+--------------------
 
-rustup (https://rustup.rs, or the distribution's package), then relibc's
-toolchain, which WORKSPACE/relibc/rust-toolchain.toml names:
-
-  rustup toolchain install nightly-2026-05-24 --component rust-src
-
-cbindgen, into this repository (tools/build-relibc looks there):
-
-  cd WORKSPACE/relibc-genode
-  cargo install --root var/tools cbindgen --version 0.29.4
-
-(CBINDGEN=/path/to/cbindgen uses another one.)
+rustup (https://rustup.rs, or the distribution's package). Nothing else:
+tools/build-relibc uses the toolchain relibc's rust-toolchain.toml names
+(rustup installs it on first use), and installs the pinned cbindgen (for
+relibc's C headers) into var/tools by itself.
 
 
 6. relibc for Genode
@@ -123,21 +116,21 @@ back (see the README, "Layout").
   cd WORKSPACE/genode
   ./tool/create_builddir x86_64 BUILD_DIR=build/x86_64_relibc
 
-In build/x86_64_relibc/etc/build.conf, uncomment:
+(BUILD_DIR= matters: without it the directory is build/x86_64.) Then
+enable the default kernel, parallel make, the optional repositories, and
+put this repository first, so that its libc wins:
 
-  KERNEL ?= nova                  (the default kernel for 'make run/...')
-  MAKE += -j<cores>
-  QEMU_OPT += -accel kvm          (if /dev/kvm exists)
-  the 'REPOSITORIES +=' lines of the optional repositories (libports,
-  ports, dde_linux, dde_rump, gems, pc, dde_bsd, dde_ipxe)
+  cd build/x86_64_relibc
+  sed -i -e 's/^#KERNEL ?= nova/KERNEL ?= nova/' \
+         -e "s/^#MAKE += -j4/MAKE += -j$(nproc)/" \
+         -e 's@^#\(REPOSITORIES += $(GENODE_DIR)/repos/\(libports\|ports\|dde_linux\|dde_rump\|gems\|pc\|dde_bsd\|dde_ipxe\)\)$@\1@' \
+         etc/build.conf
+  echo 'REPOSITORIES := $(GENODE_DIR)/../relibc-genode $(REPOSITORIES)' >> etc/build.conf
 
-and add at the end, so that this repository comes first and its libc wins:
-
-  REPOSITORIES := $(GENODE_DIR)/../relibc-genode $(REPOSITORIES)
+With /dev/kvm, also uncomment '#QEMU_OPT += -accel kvm' in etc/build.conf.
 
 Build the libraries and the ABI lists:
 
-  cd build/x86_64_relibc
   make lib/libc lib/posix lib/libm
   ../../../relibc-genode/tools/mk-symbols $PWD
 
