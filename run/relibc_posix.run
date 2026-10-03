@@ -1,0 +1,42 @@
+#
+# POSIX on relibc (relibc-genode): threads, synchronization, directories,
+# file operations, pipes, terminals, on any kernel
+#
+
+build { core lib/ld init timer lib/vfs server/log_terminal test/relibc_posix }
+
+create_boot_directory
+
+install_config {
+config
++ parent-provides
+  + service ROM
+  + service PD
+  + service RM
+  + service CPU
+  + service LOG
++ default-route
+  + any-service
+    + parent
+    + any-child
++ default | caps: 100 | ram: 1M
++ start timer
+  + provides | + service Timer
++ start log_terminal
+  + provides | + service Terminal
++ start relibc_posix | caps: 1000 | ram: 64M
+  + config
+  | + vfs
+  |   + dir tmp | + ram
+  |   + dir dev | + terminal
+-
+}
+
+build_boot_image [build_artifacts]
+
+append qemu_args " -nographic "
+
+run_genode_until {child "relibc_posix" exited with exit value} 60
+
+grep_output {relibc posix:}
+compare_output_to { [init -> relibc_posix] relibc posix: all checks passed }

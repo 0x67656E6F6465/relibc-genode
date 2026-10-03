@@ -1,0 +1,406 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 935d33be..860b0d5a 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -124,9 +124,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "a6139a8597ed92cf816dfb33f5dd6cf0bb93a6adc938f11039f371bc5bcd26c3"
+ dependencies = [
+  "chrono",
++ "chrono-tz-build",
+  "phf",
+ ]
+ 
++[[package]]
++name = "chrono-tz-build"
++version = "0.5.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "c7d8d1efd5109b9c1cd3b7966bd071cdfb53bb6eb0b22a473a68c2f70a11a1eb"
++dependencies = [
++ "parse-zoneinfo",
++ "phf_codegen",
++ "regex",
++]
++
+ [[package]]
+ name = "cipher"
+ version = "0.4.4"
+@@ -197,6 +209,12 @@ dependencies = [
+  "linux-raw-sys",
+ ]
+ 
++[[package]]
++name = "fastrand"
++version = "2.5.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
++
+ [[package]]
+ name = "find-msvc-tools"
+ version = "0.1.14"
+@@ -343,6 +361,12 @@ dependencies = [
+  "memchr",
+ ]
+ 
++[[package]]
++name = "parse-zoneinfo"
++version = "0.4.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "e3c406c9e2aa74554e662d2c2ee11cd3e73756988800be7e6f5eddb16fed4699"
++
+ [[package]]
+ name = "password-hash"
+ version = "0.5.0"
+@@ -374,6 +398,26 @@ dependencies = [
+  "phf_shared",
+ ]
+ 
++[[package]]
++name = "phf_codegen"
++version = "0.12.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "efbdcb6f01d193b17f0b9c3360fa7e0e620991b193ff08702f78b3ce365d7e61"
++dependencies = [
++ "phf_generator",
++ "phf_shared",
++]
++
++[[package]]
++name = "phf_generator"
++version = "0.12.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "2cbb1126afed61dd6368748dae63b1ee7dc480191c6262a3b4ff1e29d86a6c5b"
++dependencies = [
++ "fastrand",
++ "phf_shared",
++]
++
+ [[package]]
+ name = "phf_shared"
+ version = "0.12.1"
+@@ -522,6 +566,31 @@ dependencies = [
+  "bitflags",
+ ]
+ 
++[[package]]
++name = "regex"
++version = "1.13.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "f020237b6c8eed93db2e2cb53c00c60a8e1bc73da7d073199a1180401450218d"
++dependencies = [
++ "regex-automata",
++ "regex-syntax",
++]
++
++[[package]]
++name = "regex-automata"
++version = "0.4.18"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "ad8553b9b26413251cbf30e620595c7a41b3887f03da04579c0e6b0d6a06b4b2"
++dependencies = [
++ "regex-syntax",
++]
++
++[[package]]
++name = "regex-syntax"
++version = "0.8.11"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
++
+ [[package]]
+ name = "relibc"
+ version = "0.2.5"
+diff --git a/Cargo.toml b/Cargo.toml
+index 5729cc1b..660073ed 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -144,6 +144,11 @@ math_libm = []
+ no_trace = ["log/release_max_level_debug"]
+ # for very verbose activity beyond trace level
+ trace_tls = []
++# Genode: the system calls go to the Genode shim (relibc-genode), the ABI
++# stays Linux's. Build for x86_64-unknown-linux-gnu with this feature.
++# Genode copies a library's relocated data into every component: the time-zone
++# table only with the zones of CHRONO_TZ_TIMEZONE_FILTER (tools/build-relibc)
++genode = ["generic-rt/genode", "chrono-tz/filter-by-regex"]
+ 
+ [profile.dev]
+ panic = "abort"
+diff --git a/generic-rt/Cargo.toml b/generic-rt/Cargo.toml
+index ba01e30d..754bedb1 100644
+--- a/generic-rt/Cargo.toml
++++ b/generic-rt/Cargo.toml
+@@ -3,5 +3,10 @@ name = "generic-rt"
+ version = "0.1.0"
+ edition = "2024"
+ 
++[features]
++# Genode: no thread-pointer register for user code on every kernel, so the
++# Genode shim keeps it per thread (gxd_get_tp)
++genode = []
++
+ [lints]
+ workspace = true
+diff --git a/generic-rt/src/lib.rs b/generic-rt/src/lib.rs
+index 226c3668..0f84c190 100644
+--- a/generic-rt/src/lib.rs
++++ b/generic-rt/src/lib.rs
+@@ -2,10 +2,9 @@
+ #![allow(internal_features)]
+ #![deny(unsafe_op_in_unsafe_fn)]
+ 
+-use core::{
+-    arch::asm,
+-    mem::{self, offset_of},
+-};
++#[cfg(not(feature = "genode"))]
++use core::arch::asm;
++use core::mem::{self, offset_of};
+ 
+ #[derive(Debug)]
+ #[repr(C)]
+@@ -52,10 +51,21 @@ impl<Os> GenericTcb<Os> {
+         value
+     }
+ 
++    /// Read a usize from the TCB - Genode: the thread pointer is the shim's
++    #[inline(always)]
++    #[cfg(feature = "genode")]
++    pub unsafe fn arch_read(offset: usize) -> usize {
++        unsafe extern "C" {
++            fn gxd_get_tp() -> usize;
++        }
++        let tp = unsafe { gxd_get_tp() };
++        if tp == 0 { 0 } else { unsafe { *((tp + offset) as *const usize) } }
++    }
++
+     /// Architecture specific code to read a usize from the TCB - x86_64
+     #[expect(unsafe_op_in_unsafe_fn)]
+     #[inline(always)]
+-    #[cfg(target_arch = "x86_64")]
++    #[cfg(all(target_arch = "x86_64", not(feature = "genode")))]
+     pub unsafe fn arch_read(offset: usize) -> usize {
+         let value;
+         asm!(
+diff --git a/src/cxa.rs b/src/cxa.rs
+index c1d77247..d5882340 100644
+--- a/src/cxa.rs
++++ b/src/cxa.rs
+@@ -21,6 +21,13 @@ static CXA_ATEXIT_FUNCS: Mutex<Vec<Option<CxaAtExitFunc>>> = Mutex::new(Vec::new
+ #[thread_local]
+ static DTORS: RefCell<Vec<CxaThreadAtExitFunc>> = RefCell::new(Vec::new());
+ 
++/// Genode's execve replaces the program within the component: its exit
++/// functions go with it.
++#[cfg(feature = "genode")]
++pub(crate) fn forget_cxa_exit_functions() {
++    CXA_ATEXIT_FUNCS.lock().clear();
++}
++
+ #[unsafe(no_mangle)]
+ pub unsafe extern "C" fn __cxa_atexit(
+     func: Option<extern "C" fn(*mut c_void)>,
+diff --git a/src/header/getopt/mod.rs b/src/header/getopt/mod.rs
+index 803d6b41..727d5986 100644
+--- a/src/header/getopt/mod.rs
++++ b/src/header/getopt/mod.rs
+@@ -15,6 +15,19 @@ use core::ptr;
+ /// cbindgen:ignore
+ static mut CURRENT_OPT: *mut c_char = ptr::null_mut();
+ 
++/// Genode's execve replaces the program within the component: getopt
++/// starts anew for the next one.
++#[cfg(feature = "genode")]
++pub(crate) unsafe fn reset() {
++    unsafe {
++        CURRENT_OPT = ptr::null_mut();
++        crate::header::unistd::optarg = ptr::null_mut();
++        crate::header::unistd::opterr = 1;
++        crate::header::unistd::optind = 1;
++        crate::header::unistd::optopt = -1;
++    }
++}
++
+ /// Non-POSIX, see <https://www.man7.org/linux/man-pages/man3/getopt.3.html>.
+ pub const no_argument: c_int = 0;
+ /// Non-POSIX, see <https://www.man7.org/linux/man-pages/man3/getopt.3.html>.
+diff --git a/src/header/pthread/attr.rs b/src/header/pthread/attr.rs
+index c3d64f04..1d6075cc 100644
+--- a/src/header/pthread/attr.rs
++++ b/src/header/pthread/attr.rs
+@@ -35,7 +35,11 @@ impl Default for RlctAttr {
+             // TODO
+             stack: 0,
+             // TODO
++            #[cfg(not(feature = "genode"))]
+             stacksize: 1024 * 1024,
++            /* Genode backs a stack with RAM in full: Genode's libc's default */
++            #[cfg(feature = "genode")]
++            stacksize: crate::platform::sys::default_stack_size(),
+             param: sched_param {
+                 // TODO
+                 sched_priority: 0,
+diff --git a/src/header/stdlib/mod.rs b/src/header/stdlib/mod.rs
+index c0a9eee7..f1e71a3e 100644
+--- a/src/header/stdlib/mod.rs
++++ b/src/header/stdlib/mod.rs
+@@ -67,6 +67,16 @@ static mut RNG: Option<XorShiftRng> = None;
+ // TODO: This could be const fn, but the trait system won't allow that.
+ static RNG_SAMPLER: Once<Uniform<c_int>> = Once::new();
+ 
++/// Genode's execve replaces the program within the component: its exit
++/// functions go with it.
++#[cfg(feature = "genode")]
++pub(crate) unsafe fn forget_exit_functions() {
++    unsafe {
++        ATEXIT_FUNCS.unsafe_mut().fill(None);
++        AT_QUICK_EXIT_FUNCS.unsafe_mut().fill(None);
++    }
++}
++
+ fn rng_sampler() -> &'static Uniform<c_int> {
+     RNG_SAMPLER.call_once(|| Uniform::new_inclusive(0, RAND_MAX).expect("within bounds"))
+ }
+diff --git a/src/header/unistd/syscall.rs b/src/header/unistd/syscall.rs
+index f97e6495..ab3ad248 100644
+--- a/src/header/unistd/syscall.rs
++++ b/src/header/unistd/syscall.rs
+@@ -10,5 +10,14 @@ pub unsafe extern "C" fn syscall(sysno: c_long, mut args: ...) -> c_long {
+     let a5 = unsafe { args.next_arg::<usize>() };
+     let a6 = unsafe { args.next_arg::<usize>() };
+ 
+-    (unsafe { sc::syscall6(sysno as usize, a1, a2, a3, a4, a5, a6) }) as c_long
++    #[cfg(not(feature = "genode"))]
++    return (unsafe { sc::syscall6(sysno as usize, a1, a2, a3, a4, a5, a6) }) as c_long;
++
++    /* Genode has no system calls of this kind */
++    #[cfg(feature = "genode")]
++    {
++        let _ = (sysno, a1, a2, a3, a4, a5, a6);
++        crate::platform::ERRNO.set(crate::header::errno::ENOSYS);
++        -1
++    }
+ }
+diff --git a/src/ld_so/mod.rs b/src/ld_so/mod.rs
+index 0bf42bf1..dcbd09ec 100644
+--- a/src/ld_so/mod.rs
++++ b/src/ld_so/mod.rs
+@@ -135,7 +135,11 @@ pub unsafe fn init(
+ ) {
+     let tp: usize;
+ 
+-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
++    #[cfg(all(target_os = "linux", target_arch = "x86_64", feature = "genode"))]
++    {
++        tp = unsafe { crate::platform::sys::gxd::gxd_get_tp() };
++    }
++    #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "genode")))]
+     {
+         const ARCH_GET_FS: usize = 0x1003;
+         let mut val = 0usize;
+diff --git a/src/ld_so/tcb.rs b/src/ld_so/tcb.rs
+index ed1c4fd9..58c5c8a4 100644
+--- a/src/ld_so/tcb.rs
++++ b/src/ld_so/tcb.rs
+@@ -342,7 +342,12 @@ impl Tcb {
+     }
+ 
+     /// OS and architecture specific code to activate TLS - Linux x86_64
+-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
++    #[cfg(all(target_os = "linux", target_arch = "x86_64", feature = "genode"))]
++    unsafe fn os_arch_activate(_os: &(), tls_end: usize, _tls_len: usize) {
++        unsafe { crate::platform::sys::gxd::gxd_set_tp(tls_end) };
++    }
++
++    #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "genode")))]
+     unsafe fn os_arch_activate(_os: &(), tls_end: usize, _tls_len: usize) {
+         const ARCH_SET_FS: usize = 0x1002;
+         unsafe {
+diff --git a/src/lib.rs b/src/lib.rs
+index 8136c979..2dbc41f9 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -28,7 +28,7 @@ extern crate posix_regex;
+ extern crate rand;
+ 
+ #[cfg(target_os = "linux")]
+-#[macro_use]
++#[cfg_attr(not(feature = "genode"), macro_use)]
+ extern crate sc;
+ 
+ #[cfg(target_os = "redox")]
+diff --git a/src/platform/mod.rs b/src/platform/mod.rs
+index 386b971a..2fe8958c 100644
+--- a/src/platform/mod.rs
++++ b/src/platform/mod.rs
+@@ -20,10 +20,14 @@ mod pal;
+ 
+ pub use self::sys::Sys;
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(all(target_os = "linux", not(feature = "genode")))]
+ #[path = "linux/mod.rs"]
+ pub(crate) mod sys;
+ 
++#[cfg(all(target_os = "linux", feature = "genode"))]
++#[path = "genode/mod.rs"]
++pub(crate) mod sys;
++
+ #[cfg(target_os = "redox")]
+ #[path = "redox/mod.rs"]
+ pub(crate) mod sys;
+diff --git a/src/pthread/mod.rs b/src/pthread/mod.rs
+index 6760fe07..b37fce57 100644
+--- a/src/pthread/mod.rs
++++ b/src/pthread/mod.rs
+@@ -137,6 +137,11 @@ pub(crate) unsafe fn create(
+ 
+     let stack_size = attrs.stacksize.next_multiple_of(Sys::getpagesize());
+ 
++    // Genode runs a thread on a stack of its own, of the size passed below:
++    // the one mapped here only carries the start arguments
++    #[cfg(feature = "genode")]
++    let (thread_stack_size, stack_size) = (stack_size, if attrs.stack != 0 { stack_size } else { Sys::getpagesize() });
++
+     let stack_base = if attrs.stack != 0 {
+         attrs.stack as *mut c_void
+     } else {
+@@ -196,6 +201,9 @@ pub(crate) unsafe fn create(
+             push(0);
+         }
+         push(0);
++        #[cfg(feature = "genode")]
++        push(thread_stack_size);
++        #[cfg(not(feature = "genode"))]
+         push(0);
+         push(ptr::from_ref(synchronization_mutex) as usize);
+         push(ptr::from_mut(new_tcb) as usize);
+diff --git a/src/start.rs b/src/start.rs
+index 0fb3c8f3..53df42e3 100644
+--- a/src/start.rs
++++ b/src/start.rs
+@@ -109,6 +109,9 @@ pub unsafe fn relibc_verify_host() {
+         intrinsics::abort();
+     }
+ }
++// Not on Genode: its dynamic linker runs constructors before the component
++// exists (no shim, no TLS yet); relibc_start calls init_array instead.
++#[cfg(not(feature = "genode"))]
+ #[unsafe(link_section = ".init_array")]
+ #[used]
+ static INIT_ARRAY: [extern "C" fn(); 1] = [init_array];
+diff --git a/src/sync/cond.rs b/src/sync/cond.rs
+index fa63fef0..513e7052 100644
+--- a/src/sync/cond.rs
++++ b/src/sync/cond.rs
+@@ -60,6 +60,11 @@ impl Cond {
+         self.wake(i32::MAX)
+     }
+     pub fn signal(&self) -> Result<(), Errno> {
++        // Genode's tests (test-pthread) expect a signal to wake one waiter,
++        // so that the others' timed waits time out
++        #[cfg(feature = "genode")]
++        return self.wake(1);
++        #[cfg(not(feature = "genode"))]
+         self.broadcast()
+         //self.wake(1)
+     }

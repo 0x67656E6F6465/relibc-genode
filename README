@@ -1,0 +1,471 @@
+
+                         relibc on Genode
+
+relibc (Redox's C library, in Rust) as the C library of Genode components,
+instead of Genode's FreeBSD-based libc. A Genode repository: add it to
+REPOSITORIES in the build directory's etc/build.conf.
+
+relibc is not forked here: tools/get-relibc clones upstream relibc and
+applies what this repository keeps of it, the Genode platform module
+(relibc/src/platform/genode) and two patches (patches/). SETUP describes
+everything from a clean machine on: host packages, Genode's tool chain,
+Genode, Rust, the build directory and the tests.
+
+  relibc/     what goes into relibc: its Genode platform module
+              (relibc/src/platform/genode, the place it has in relibc)
+  patches/    the rest of relibc's changes: generic fixes, and the few
+              Genode lines outside the platform module; the base commit
+  src/        the Genode side: the shim (src/lib/relibc_genode), tests,
+              ports that need a different build file with relibc
+  lib/        Genode build files: relibc as libc.lib.so, the shim library
+  include/    headers for code written against Genode's FreeBSD libc
+  run/        test scenarios
+  recipes/    depot recipes (relibc_hello, for Sculpt)
+  tools/      get-relibc, save-relibc, build-relibc, mk-symbols
+  var/        build output of tools/build-relibc (not in git)
+
+The details are under "Layout" at the end.
+
+
+Status
+------
+
+Runs on NOVA (Sculpt's kernel), hw and base-linux, with relibc's C
+headers:
+
+* stdio, malloc, arguments and environment from the config, exit codes
+* threads (pthread_create/join/cancel, mutexes, condition variables, timed
+  waits, per-thread errno)
+* files and directories of the component's VFS: open/read/write/lseek,
+  pread/pwrite, O_APPEND, ftruncate, fsync, stat/fstat/lstat,
+  opendir/readdir, mkdir, rmdir, unlink, rename, access, chdir/getcwd and
+  relative paths, symbolic links (symlink, readlink, followed in paths,
+  O_NOFOLLOW, ELOOP), as Genode's libc follows them; mmap of files
+  (MAP_PRIVATE, a copy, as Genode's libc), fcntl locks and flock (granted:
+  one component), fstatvfs
+* Genode's libc config: '+ libc' with stdin, stdout, stderr (files of the
+  VFS, else no input and the LOG), cwd, rtc and rng (VFS files)
+* processes, as with Genode's libc: fork (a child component of the same
+  binary, which copies the parent's state), execve (the program replaced
+  within the component, scripts with "#!"), posix_spawn (a child component
+  of another program, with file actions), waitpid/wait4 (WNOHANG),
+  SIGCHLD, getpid/getppid, FD_CLOEXEC (fcntl, O_CLOEXEC, SOCK_CLOEXEC)
+* pipes: of the VFS's pipe plugin with '+ libc | pipe: /pipe' (as Genode's
+  libc), which reach forked and spawned children and other components,
+  else between the component's threads; O_NONBLOCK; socketpair (AF_UNIX
+  streams within the component), dup/dup2/F_DUPFD
+* fds from the config, as with Genode's libc: '+ libc | + fd | id: 3 |
+  path: /file | readable: yes | seek: 5'
+* poll, select and epoll (pipes, files, standard I/O)
+* sockets, TCP and UDP over IPv4, through the VFS's socket file system as
+  with Genode's libc ('+ libc | socket: /socket', the IP stack lwip or
+  lxip in the VFS, of the component or of a VFS server): socket, bind,
+  listen, accept, connect (also non-blocking), send/recv(from/to/msg), MSG_PEEK,
+  MSG_DONTWAIT, getsockname/getpeername, the socket options the IP stack
+  keeps, poll/select/epoll on sockets; the nameserver for relibc's
+  resolver from the socket file system ('<socket>/nameserver', or
+  '+ libc | nameserver_file'), as with Genode's libc (not tested against
+  a DNS server yet)
+* signals within the component, as with Genode's libc: sigaction (also
+  SA_SIGINFO, SA_RESETHAND, SA_NODEFER), raise, kill of the component
+  itself, masks per thread, sigpending, sigsuspend and pause, sigtimedwait,
+  alarm and setitimer (ITIMER_REAL), POSIX timers (timer_create with
+  SIGEV_SIGNAL); delivered when the program enters relibc's platform
+  (raise, kill, sigprocmask, sigsuspend, sleeping, poll/select/epoll,
+  which a signal interrupts with EINTR), default actions end the component
+* terminals of the VFS (its terminal plugin): isatty, tcgetattr/tcsetattr
+  and TIOCGWINSZ, from the terminal's info node as Genode's libc reads it
+* clocks and sleeping (Timer); CLOCK_REALTIME from the '+ libc | rtc'
+  file (Genode's rtc VFS plugin) or, with '+ relibc | rtc: yes', an Rtc
+  session; getrandom from the '+ libc | rng' file, else /dev/random of the
+  VFS if it has one (e.g. vfs_jitterentropy)
+
+run/relibc_posix.run checks most of that (86 checks), run/relibc_process.run
+the processes (in a build directory with relibc as the libc, below),
+run/relibc_hello.run the basics. It runs in Sculpt, too (see "In Sculpt").
+
+  tools/get-relibc && tools/build-relibc         # once, and after relibc changes
+  cd ../genode/build/x86_64
+  make run/relibc_posix                          # NOVA in QEMU (the build dir's default)
+  make run/relibc_posix KERNEL=hw    BOARD=pc
+  make run/relibc_posix KERNEL=linux BOARD=linux
+
+Not yet: signals between components (kill of a child, SIGCHLD aside) and
+SIGEV_THREAD timers (Linux's sigevent, which relibc uses, has no place for
+the function), fork from another thread than main's, posix_spawn's
+signal attributes (a spawned child starts with the default mask and
+actions), process groups and sessions, stopped children, the VFS's OSS
+and tap ioctls (Genode's libc translates FreeBSD's SNDCTL_* and
+TAPGIFNAME), IPv6 and named Unix-domain sockets (as with Genode's libc),
+shared mappings of files and across fork.
+Everything not implemented returns ENOSYS.
+
+Limits: C code must not declare __thread variables itself (that
+would be fs-relative); errno and relibc's own thread-locals are fine.
+Pipes and sockets within the component (not of the VFS) do not reach
+children; a child reopens the parent's files by their paths, with their
+positions, but has positions of its own from then on (as with Genode's
+libc).
+pthread_cancel stops the thread at once, as Genode's libc does (relibc
+sends a signal on Linux, which Genode does not deliver): asynchronous, so
+a lock the thread holds stays locked, and its cleanup handlers do not run.
+
+
+Compared with Genode's libc
+---------------------------
+
+Measured on base-linux, both libcs in their own build directory:
+
+* Stock test packages that use libc (31; run/pkg_test.run): Genode's libc
+  passes 26 (the other 5 need more than the runner offers, or fail with
+  either libc). relibc passes 20 of those 26, now with fork, execve and
+  pipes. Of the 6 others, libc and kqueue test FreeBSD's API (they do not
+  compile), libc_connect_* (4) use FreeBSD's sockaddr layout.
+* Exported C functions (libc and libm): 1191 for Genode's libc, 1193 for
+  relibc, 954 in common. Only Genode's: mostly FreeBSD's own (sysctl,
+  kqueue, fts, vis, getfsent, cget*), and of POSIX: fork's family (vfork,
+  wait3), getcontext/makecontext/swapcontext, ftw/nftw, hsearch/lsearch,
+  open_memstream, wordexp, SysV semaphores, sem_open, aio, fenv,
+  clock_nanosleep, posix_fadvise, readdir_r. Only relibc's: the *at
+  functions, epoll, POSIX timers, sigtimedwait/sigwait, C11 threads,
+  pthread barriers and spin locks, shm_open, *_l locale variants.
+* Memory: relibc's data was 1 MiB larger, nearly all chrono-tz's time-zone
+  table, which Genode copies into every component (relocated data). With
+  only UTC and Etc/* built in, a component's RAM at start went from
+  1788 KiB to 780 KiB (measured in libc_udp_unreachable_lxip); threads
+  have Genode's libc's default stack size. libc.lib.so is 4.2 MiB (with
+  openlibm) against 2.3 MiB (libc and libm).
+* Code to maintain for Genode: the shim (5300 lines of C++) and relibc's
+  platform module (1400 lines of Rust), against Genode's libc glue (18700
+  lines) on FreeBSD's libc.
+
+Where Genode's libc is ahead: OSS and tap ioctls, long double
+(relibc's printf supports only %La of it, strtold goes through double), locales (relibc has C and
+locale files). Where relibc is
+ahead: a Linux ABI and glibc-like headers (ports configured for Linux),
+POSIX additions Genode's libc lacks (above), and an upstream that is not
+Genode's to maintain.
+
+
+relibc as the libc
+------------------
+
+relibc can take the place of Genode's FreeBSD-based libc for everything
+built in a build directory that lists this repository first:
+
+  REPOSITORIES := $(GENODE_DIR)/../relibc-genode $(REPOSITORIES)
+
+(genode/build/x86_64_relibc does; the build system takes the first
+repository with a file, so this one's lib/mk/{libc,posix,libm}.mk,
+lib/import/import-{libc,posix}.mk and lib/symbols/* win.) Then libc.lib.so
+is relibc with openlibm and the shim, posix.lib.so is Genode's own
+posix/construct.cc, and Genode's libc API (Libc::Component, Libc::Env,
+Libc::with_libc, libc/args.h) works as before. Programs need no changes.
+
+After a change of relibc or the shim, in that build directory:
+
+  ../../../relibc-genode/tools/build-relibc
+  make lib/libc lib/posix lib/libm
+  ../../../relibc-genode/tools/mk-symbols $PWD      # the ABI lists, if exports changed
+
+Compile status (all targets of the Genode tree that use libc or posix):
+of the 85 outside Qt (whose ports are not prepared here), 77 compile, one
+is for 32-bit only (gmp's test), and the 7 others test FreeBSD's API (see
+"Known gaps"), among them every application, server and driver: lighttpd,
+the wifi driver with wpa_supplicant, stdcxx, e2fsprogs, mupdf, ...
+
+Stock Genode test packages that pass unchanged (run/pkg_test.run below):
+stdcxx, pthread and libc_vfs_ram (base-linux and NOVA), libc_vfs_fs,
+libc_getenv, libc_deferred_unlink, ldso, libc_with_libc,
+libc_many_writes, and over the network tcp_bulk_lwip and tcp_bulk_lxip
+(8 MiB both ways, the IP stack in the component and in a VFS server),
+libc_udp_unreachable_lwip and _lxip, libc_execve, libc_fork and
+libc_pipe (the latter three also on NOVA, with the VFS's pipes across
+components). (The tcp_bulk tests hang now and
+then on base-linux, with "Packet dropped" at the NIC bridge: with Genode's
+libc as often, 2 of 8 runs. With relibc, core warns "invalid
+signal-context capability" when a component exits: not yet understood.)
+libc_alarm passes (base-linux and NOVA); libc_connect_* fail as their server
+(test/netty) initializes sockaddr_in for FreeBSD's layout (sin_len first).
+
+Applications: run/relibc_lighttpd_fetchurl.run (Genode's
+ports/run/lighttpd_fetchurl.run with every component built here, not
+taken from the depot) serves 1 MiB with lighttpd and downloads it with
+fetchurl (curl), both on relibc, over lwip and the NIC router. ieee754 runs; its output differs
+from Genode's FreeBSD reference where relibc prints NaN as "-nan" (as
+glibc) and long double through double, and where relibc rounds correctly
+and the reference does not (pow(0.5, 0.5) = 0.707107).
+
+run/pkg_test.run runs one of Genode's test packages as depot_autopilot
+would, from its recipe (program, libraries, config, success pattern), for
+tests that need no other components:
+
+  make run/pkg_test TEST=test-pthread KERNEL=linux BOARD=linux
+
+Header compatibility: include/relibc-compat comes first. It wraps relibc
+headers where Genode's code relies on FreeBSD behaviour (fd_set through
+sys/types.h and unistd.h, struct tm through sys/stat.h, no PAGE_SIZE in
+limits.h, _*_T_DECLARED marks, float.h from the compiler) and provides
+FreeBSD and glibc headers that ports configured for Genode's libc expect
+(sys/limits.h, sys/disk.h, sys/disklabel.h, sys/mount.h, mntent.h,
+net/if_dl.h, net/ethernet.h, xlocale.h, byteswap.h, ...), each
+honest about Genode (no mount table, the disk size from the VFS). relibc's
+headers select their Linux ABI by __relibc_linux_abi__ instead of
+__linux__ (tools/build-relibc rewrites cbindgen's mapping), so that ports
+configured for Genode's libc do not take Linux-only code paths. The C
+functions relibc lacked, which ports need, are now relibc's own
+(relibc-fixes.patch, see below).
+
+Ports whose Genode glue is written for FreeBSD's libc get a build file of
+their own here, which takes the place of the original in this build
+directory only (the first repository's wins) and builds the original with
+a difference: lighttpd (Genode's patch removes AT_FDCWD, relibc's stdio.h
+would still select renameat2), libnl (dde_linux's libnl_emul.h defines
+Linux socket types relibc has), wpa_supplicant and wpa_driver_nl80211
+(glibc's byte-order macros; the emulated Linux constants relibc defines
+as macros). They are src/app/lighttpd, lib/mk/libnl*.mk and
+lib/mk/wpa_*.mk.
+
+Known gaps, the 7 that do not compile: tests of FreeBSD's own API, which
+a Linux-ABI libc does not have: test/libc (syscall(SYS_thr_self)),
+libc_getaddrinfo (sockaddr's sa_len), libc_getpwent and libc_getgrent
+(setpassent, setgroupent), libc_kqueue (kqueue), libc_vfs_tap
+(net/if_tap.h), oss (FreeBSD's sys/soundcard.h).
+
+relibc fixes made on the way (patches/relibc-fixes.patch, independent of
+Genode, for upstream): %a/%A in
+printf (and %La exactly for x86's 80-bit long double), %g's precision for
+values below 1 and its exponent for values below f64::EPSILON, a second
+_POSIX_THREADS in pthread.h, [[noreturn]] where GCC's C++ refuses it,
+threads cancellable by default (as POSIX says), exit from another thread
+than main (relibc cancelled the calling thread, too), FD_CLOEXEC as 1 on
+Linux (relibc had O_CLOEXEC's value), sig_atomic_t as int (as
+glibc), ioctl variadic (as glibc), if_indextoname writing to its buffer
+and returning it (as POSIX), sem_wait failing with EAGAIN when the count
+changed just before its futex wait (it retries now); and what it lacked:
+getentropy (a stub before), arc4random, arc4random_buf and
+arc4random_uniform, wcstof and wcstold, fileno_unlocked, finite and
+finitef, accept4, and search.h (tsearch, tfind, tdelete, twalk, tdestroy).
+
+
+In Sculpt
+---------
+
+relibc_hello runs in the sculpt-declarative image (SCULPT=declarative) as
+the package sdecl/pkg/relibc_hello, exported with Genode's depot tool from
+recipes/. Its output is in Sculpt's log (Bosun: Logs). After a change:
+
+  tools/build-relibc                                   # if relibc changed
+  cd ../genode
+  REPOS="$(ls -d $PWD/repos/* | tr '\n' ' ') $(cd ../relibc-genode && pwd)"
+  ./tool/depot/extract sdecl/pkg/relibc_hello "REPOSITORIES=$REPOS" UPDATE_VERSIONS=1 FORCE=1
+  ./tool/depot/build sdecl/bin/x86_64/relibc_hello/<src version>    # recipes/src/relibc_hello/hash
+  cd ../sculpt-declarative && sdecl pin relibc-hello && sdecl switch
+  cd ../genode/build/x86_64 && make run/sculpt SCULPT=declarative
+
+extract and build run separately: given to create, REPOSITORIES (needed
+to find these recipes) would also reach the sandboxed bin build, which
+then scans every repository. The pkg archive names genodelabs' vfs with
+its version (recipes/pkg/relibc_hello/archives): the depot tool versions
+only the exporting user's own archives, and an unversioned entry leaves
+the package "incomplete" in Sculpt. used_apis are plain names, so the
+user 'sdecl' gets build-time copies of genodelabs' API archives.
+
+
+How it works
+------------
+
+relibc keeps its Linux ABI (types, constants, struct layouts, headers) and
+is built for x86_64-unknown-linux-gnu, with the cargo feature 'genode'
+(the platform module relibc/src/platform/genode and
+patches/relibc-genode.patch, on top of relibc-fixes.patch). The feature
+replaces only relibc's system calls: its platform module
+(src/platform/genode) calls the gxd_* functions of the shim instead.
+
+Why a shim: on Linux, relibc's platform makes system calls, a stable ABI
+of the kernel. Genode has none of the kind: files, timers, threads and the
+LOG are C++ objects (Vfs::File_system, Timer::Connection, Genode::Thread)
+reached through the component's Env, which Rust cannot call. The shim is
+that layer in C++ and offers it as C functions, the gxd_* ones; gxd.rs
+is their declaration, the counterpart of Linux's
+system-call numbers. The platform module translates relibc's calls to
+them and keeps what needs no Genode at all in Rust (signal actions and
+masks, iovec gathering, file mappings as copies).
+
+The platform module is laid out as relibc's Linux one: mod.rs (the Pal:
+files, memory, time, threads, the process), epoll.rs, socket.rs,
+signal.rs, ptrace.rs, and gxd.rs (the shim's C ABI). Each method is the
+Linux one's call translated to the shim; what Genode has no counterpart
+for returns ENOSYS. Outside of it, the 'genode' feature touches relibc in
+few places, each a cfg next to the Linux code it replaces:
+
+* Cargo.toml, platform/mod.rs: the feature and the platform's selection;
+  chrono-tz's 'filter-by-regex' (tools/build-relibc builds in UTC and
+  Etc/*, RELIBC_TIMEZONES for more: Genode copies a library's relocated
+  data into every component, and the full table is 1 MiB of it)
+* generic-rt, ld_so/mod.rs, ld_so/tcb.rs: the thread pointer is the
+  shim's (gxd_get_tp, gxd_set_tp) instead of the fs register (see TLS)
+* start.rs: no .init_array entry (see below)
+* unistd/syscall.rs: syscall() returns ENOSYS
+* pthread/mod.rs: pthread_create maps a page for the start arguments only
+  and passes the stack size beside them (the thread runs on a Genode stack)
+* pthread/attr.rs: the default stack size is Genode's libc's
+  (Libc::Component::stack_size, 256 KiB), not 1 MiB: Genode backs a stack
+  with RAM in full
+* stdlib, cxa.rs, getopt: functions to forget the atexit functions and to
+  reset getopt, for execve
+* sync/cond.rs: pthread_cond_signal wakes one waiter (relibc wakes all
+  "for now"; Genode's test-pthread checks that the others' timed waits
+  time out)
+
+Everything else is in the shim: pthread_cancel, for example, is relibc's
+own (rlct_kill with its cancel signal), which the platform implements by
+having the shim stop the thread; the nameserver for relibc's resolver is
+an /etc/resolv.conf the shim provides where the VFS has none.
+
+  C program ── relibc ──gxd_*──▶ shim (src/lib/relibc_genode) ──▶ LOG, Timer, Rtc,
+                                                              VFS, RAM, CPU
+
+The shim, one file per concern: state.h (shared state and locking),
+start.cc (start and exit), posix_main.cc (main in a thread of its own),
+ep.cc (the entrypoint's work for the other threads), fd.h/fd.cc (fds:
+standard I/O, VFS files and directories as Linux dirent64 records, pipes,
+the config's fds), epoll.cc, fs.cc (paths: resolution against the working
+directory, unlink, mkdir, rename, ...), memory.cc (anonymous mappings),
+time.cc, socket.cc (sockets through the VFS's socket file system),
+signals.cc (pending signals, POSIX timers), thread.cc (threads, emulated
+TLS, futexes, cancellation; exited threads are reaped by the next
+pthread_create), exec.cc (execve), fork.cc (fork, posix_spawn, waitpid),
+libc_component.cc (Genode's libc API). The shim has no static
+constructors (a forked child would run them only at its execve).
+
+Programs build with 'LIBS += relibc_genode' (lib/import/import-relibc_genode.mk):
+relibc's headers, compiled with -D__relibc_linux_abi__ (they select the
+Linux ABI by it), and relibc linked statically.
+
+Starting: the shim's Component::construct builds the initial stack that
+relibc expects from Linux (argc, argv and envp from the config's
+'+ arg | value: ...' and '+ env | key: ... | value: ...', and an auxiliary
+vector) and calls relibc_start_v1, which sets up TLS and relibc and
+returns instead of running main. Then Libc::Component::construct runs, as
+with Genode's libc: the posix library's (posix_main.cc) starts main in a
+thread of its own, and exit ends the component through the parent, after
+syncing the fds' pending writes (Genode's libc closes them).
+
+The entrypoint: the component's VFS (files, terminals, file-system
+sessions, an IP stack in the component) is used by the entrypoint alone,
+which also dispatches its I/O signals, as with Genode's libc. Another
+thread hands its VFS work over as a job and blocks (ep.cc); the entrypoint
+executes it, again whenever the VFS reports progress
+(Vfs::Env::User::wakeup_vfs_user), until it completes, and wakes the
+thread. Nothing polls: deadlines (timed waits, poll timeouts, sleeping)
+end through one timeout of the entrypoint at the earliest of them. Code
+that runs on the entrypoint (a Libc::Component's) executes its jobs at
+once and dispatches I/O signals while one is incomplete.
+
+TLS: x86_64 programs normally reach thread-local variables through the fs
+register, which NOVA and hw do not let a program set (no CR4.FSGSBASE, and
+the fs base is not kept per thread). So relibc is built with emulated TLS
+(-Z tls-model=emulated, as goa's Rust target for Genode does): every
+thread-local is reached through __emutls_get_address. relibc's goes to
+the shim's (libc.mk links it with --wrap=__emutls_get_address; the
+dynamic linker's serves everything else), a table per thread in
+anonymous memory, which a forked child inherits. relibc's thread pointer
+(its TCB, generic-rt's 'genode' feature) is likewise a value the shim
+keeps per thread (gxd_set_tp, gxd_get_tp). Nothing depends on the kernel,
+and Genode itself is unchanged. The shim hands relibc a program header
+table with an empty PT_TLS entry, which makes it set up its TCB.
+
+Threads: relibc prepares a thread like for Linux's clone (entry point and
+arguments on a stack it allocated, here only a page, with the size the
+thread asked for beside them). The shim starts a Genode thread of that
+stack size, which reads those words and makes the call. Futex waiters
+queue per address and block on a Genode Blockade.
+
+Processes, as with Genode's libc:
+
+* execve: Genode's dynamic linker replaces the program within the
+  component (Dynamic_linker::respawn); the libraries, the VFS and the fds
+  (but those with FD_CLOEXEC) stay. relibc's platform forgets the
+  program's atexit functions, signal handlers, getopt's position and other
+  threads first. The program is the ROM module of its resolved path, which
+  the VFS must show (e.g. '+ rom name'); "#!" names an interpreter.
+* fork: the component becomes the parent of a child of the same binary.
+  The parent serves it the binary's and libraries' ROM modules, its config
+  (the parent's, with the fds, the working directory and the pid) and a
+  clone session, through which the child copies the parent's memory: what
+  relibc keeps (its data, apart from the shim's by relibc_state.ld), the
+  data of the program and its libraries (those loaded before the VFS, but
+  ld, libc, libm and vfs), the anonymous mappings (relibc's heap, TCBs and
+  TLS), and the stack of the forking thread. The shim and its VFS the
+  child builds from the config. The mappings lie in an address window of
+  their own (16 TiB, 1 TiB), where the shim places them, so that the child
+  puts them at the same addresses whatever else it attached before. The
+  forking thread continues in the child on a thread with its stack at the
+  same address: the thread of main (fork from another thread: ENOSYS).
+* posix_spawn: a child of the program's ROM module, with the parent's
+  config, the arguments, the environment, the working directory and the
+  fds (relibc's file actions applied to the parent's in spawn.rs). Nothing
+  is copied, and any thread may spawn.
+* waitpid: the exit codes of both kinds of children; SIGCHLD when the
+  program catches or blocks it (else it is ignored, as by default).
+* Resources: a child gets 2.5 MB and 100 caps (as Genode's libc gives a
+  forked child), a forked one also what it copies; more on its request,
+  from the parent's quota.
+
+relibc's .init_array constructor is not registered on Genode: Genode's
+dynamic linker would run it before the component exists. relibc_start
+calls it instead. Likewise the shim has no static objects with
+constructors or destructors (their atexit registration would reach relibc
+before it is initialized, and a forked child would run the constructors at
+its execve).
+
+
+Layout
+------
+
+  relibc/src/platform/genode/   relibc's Genode platform module (the Pal), as it
+                                goes into relibc: for upstream as it is
+  patches/relibc-fixes.patch    relibc bug fixes, independent of Genode
+  patches/relibc-genode.patch   the 'genode' feature outside the platform module:
+                                the few cfgs (both against patches/relibc.commit,
+                                applied in this order)
+  tools/get-relibc              clone relibc into ../relibc, apply the
+                                patches, copy the platform module into it
+  tools/save-relibc             the reverse, after editing ../relibc: the
+                                platform module back, relibc-genode.patch anew
+  tools/build-relibc            build relibc and its C headers into var/relibc/
+  tools/nixos/shell.nix         the build environment on NixOS (SETUP)
+  src/lib/relibc_genode/        the shim and the program start
+  src/lib/relibc_genode/relibc_state.ld  relibc's data apart from the shim's (fork)
+  lib/mk/relibc_genode.mk       the shim as a library
+  lib/import/import-relibc_genode.mk  what programs on relibc get
+  lib/mk/{libc,posix,libm}.mk   relibc as Genode's libc (see "relibc as the libc")
+  lib/import/import-{libc,posix}.mk, lib/symbols/{libc,posix,libm}
+  include/relibc-compat/        headers for code written against Genode's libc
+  tools/mk-symbols              the ABI lists, from the built libraries
+  src/app/lighttpd, lib/mk/{libnl,libnl_include,wpa_*}.mk, src/lib/{libnl,
+  wpa_driver_nl80211}/include   Genode's ports on relibc (see above)
+  src/test/relibc_hello/        a first test program
+  src/test/relibc_posix/        the POSIX test (threads, files, pipes, poll)
+  src/test/relibc_process/      the process test (posix_spawn, fork, execve,
+                                waitpid, SIGCHLD), with relibc as the libc
+  run/relibc_*.run              the tests
+  run/pkg_test.run              Genode's test packages, on relibc (also those
+                                that run an init of their own)
+  run/relibc_lighttpd_fetchurl.run  lighttpd and curl, on relibc
+  recipes/                      depot recipes: src and pkg of relibc_hello
+
+Working on relibc: edit ../relibc (it is a git checkout at the base
+commit, so 'git -C ../relibc diff' shows everything), build with
+tools/build-relibc, and keep the changes with tools/save-relibc. A fix
+that is independent of Genode belongs into patches/relibc-fixes.patch
+(by hand; then tools/get-relibc on a fresh ../relibc and
+tools/save-relibc). Moving to a newer relibc: change patches/relibc.commit,
+remove ../relibc, run tools/get-relibc and resolve what does not
+apply.
+
+Toolchain: relibc's rust-toolchain.toml (nightly-2026-05-24 with rust-src),
+through rustup, and cbindgen for the headers (var/tools/bin/cbindgen:
+cargo install --root var/tools cbindgen, or CBINDGEN=...). tools/build-relibc calls that toolchain's binaries
+directly, since the system's cargo and rustc come first on the PATH here.

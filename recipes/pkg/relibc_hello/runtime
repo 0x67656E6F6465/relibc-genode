@@ -1,0 +1,16 @@
+runtime | ram: 32M | caps: 300 | binary: relibc_hello
+
++ requires
+  + timer
+
++ config
+  + arg | value: relibc_hello
+  + arg | value: sculpt
+  + env | key: HOME | value: /home
+  + vfs
+    + dir tmp | + ram
+
++ content
+  + rom | label: relibc_hello
+  + rom | label: vfs.lib.so
+-

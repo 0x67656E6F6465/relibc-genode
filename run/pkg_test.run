@@ -1,0 +1,108 @@
+#
+# Run one of Genode's test packages (repos/*/recipes/pkg/TEST/runtime) from
+# a build directory: its program, the libraries it names, its config and
+# its success pattern, as depot_autopilot would. With relibc as the libc
+# (a build directory that lists relibc-genode first), the stock tests run
+# on relibc unchanged.
+#
+#   make run/pkg_test TEST=test-stdcxx
+#   RAM=3M make run/pkg_test TEST=...      # another RAM quota for the program
+#
+
+if {![info exists ::env(TEST)]} {
+	puts stderr "Error: name the test package: make run/pkg_test TEST=test-..."
+	exit 1
+}
+set pkg $::env(TEST)
+
+set runtime_file ""
+foreach dir [glob -nocomplain [genode_dir]/repos/*/recipes/pkg/$pkg] {
+	set runtime_file $dir/runtime }
+if {$runtime_file == ""} {
+	puts stderr "Error: no test package '$pkg'"; exit 1 }
+
+set fd [open $runtime_file]; set runtime [read $fd]; close $fd
+set lines [split $runtime "\n"]
+
+# resources and program
+regexp {binary: ([^ |\n]+)} [lindex $lines 0] dummy binary
+set ram  64M;  regexp {ram: ([^ |\n]+)}  [lindex $lines 0] dummy ram
+if {[info exists ::env(RAM)]} { set ram $::env(RAM) }
+set caps 600;  regexp {caps: ([^ |\n]+)} [lindex $lines 0] dummy caps
+
+# success pattern ('*' as a wildcard) and timeout
+set succeed ""; set succeed2 ""
+regexp {\+ succeed \|[^\n]*?\| : ([^\n]+)|\+ succeed \| : ([^\n]+)} $runtime dummy succeed succeed2
+if {$succeed == ""} { set succeed $succeed2 }
+# success by exit code only: init's report of it
+if {$succeed == "" && [regexp {\+ succeed \| exit: ([0-9-]+)} $runtime dummy code]} {
+	set succeed "child \"$binary\" exited with exit value $code" }
+if {$succeed == ""} {
+	puts stderr "Error: no success pattern in $runtime"; exit 1 }
+set pattern [string map {* .* ( \\( ) \\) [ \\[ ] \\] . \\.} $succeed]
+set pattern [string map {\\.* .*} $pattern]
+set timeout 60
+regexp {after_seconds: ([0-9]+)} $runtime dummy timeout
+
+# the '+ config' subtree, indented below the start node
+set config ""
+set in_config 0
+foreach line $lines {
+	if {$in_config} {
+		if {[regexp {^(\+ |-)} $line]} { break }
+		append config "  $line\n"
+	}
+	if {[regexp {^\+ config} $line]} {
+		set in_config 1
+		append config "  $line\n"
+	}
+}
+
+# the libraries of the content, and the programs' targets: the binary's,
+# and for a package that runs an init of its own, each program it names
+set libs { lib/ld lib/vfs }
+set targets {}
+foreach {dummy rom} [regexp -all -inline {rom \| label: ([A-Za-z0-9_.-]+)} $runtime] {
+	if {[regexp {^(.*)\.lib\.so$} $rom dummy lib]} {
+		if {$lib != "ld"} { lappend libs lib/$lib }
+		continue
+	}
+	if {$rom == "init"} continue
+	set found [exec sh -c "grep -rslE '^TARGET *:?= *$rom *\$' --include=target.mk \
+	                       [genode_dir]/repos/*/src || true"]
+	if {$found == ""} {
+		puts stderr "Error: no target for the ROM '$rom' of $pkg"; exit 1 }
+	set dir [file dirname [lindex [split $found "\n"] 0]]
+	regexp {/src/(.*)$} $dir dummy t
+	lappend targets $t
+}
+
+build "core init timer [lsort -unique $libs] [lsort -unique $targets]"
+
+create_boot_directory
+
+install_config "
+config
++ parent-provides
+  + service ROM
+  + service PD
+  + service RM
+  + service CPU
+  + service LOG
++ default-route
+  + any-service
+    + parent
+    + any-child
++ default | caps: 100 | ram: 1M
++ start timer
+  + provides | + service Timer
++ start $binary | caps: $caps | ram: $ram
+$config-
+"
+
+# build-time helpers (e.g., test-ldso's dummy program) are no boot modules
+build_boot_image [lsearch -all -inline -not [build_artifacts] dummy-*]
+
+append qemu_args " -nographic "
+
+run_genode_until $pattern $timeout

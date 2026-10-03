@@ -1,0 +1,50 @@
+#
+# A C program on relibc (relibc-genode) instead of Genode's libc, on any
+# kernel (relibc uses emulated TLS, see README).
+#
+
+build { core lib/ld init timer lib/vfs test/relibc_hello }
+
+create_boot_directory
+
+install_config {
+config
++ parent-provides
+  + service ROM
+  + service PD
+  + service RM
+  + service CPU
+  + service LOG
++ default-route
+  + any-service
+    + parent
+    + any-child
++ default | caps: 100 | ram: 1M
++ start timer
+  + provides | + service Timer
++ start relibc_hello | caps: 200 | ram: 32M
+  + config
+  | + arg | value: relibc_hello
+  | + arg | value: one
+  | + env | key: HOME | value: /home
+  | + vfs
+  |   + dir tmp | + ram
+-
+}
+
+build_boot_image [build_artifacts]
+
+append qemu_args " -nographic "
+
+run_genode_until {child "relibc_hello" exited with exit value 0} 30
+
+grep_output {\[init -\> relibc_hello\] (Hello|HOME|read|file size|fopen)}
+
+compare_output_to {
+[init -> relibc_hello] Hello from relibc on Genode (2 args, argv[0] = relibc_hello)
+[init -> relibc_hello] HOME=/home
+[init -> relibc_hello] read: line one
+[init -> relibc_hello] read: line two 2
+[init -> relibc_hello] file size 20
+[init -> relibc_hello] fopen of a missing file: failed (No such file or directory)
+}

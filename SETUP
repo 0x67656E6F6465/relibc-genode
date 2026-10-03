@@ -1,0 +1,178 @@
+
+                 Setting up relibc-genode from scratch
+
+From a clean machine to relibc as Genode's libc, with the tests passing.
+Every step is a command to run; the expected result follows it. (Written so
+that a person or an AI agent can follow it top to bottom.)
+
+
+1. Workspace layout
+-------------------
+
+All repositories are siblings in one directory, called WORKSPACE here:
+
+  WORKSPACE/genode/              Genode, tag sculpt-26.04
+  WORKSPACE/relibc-genode/       this repository
+  WORKSPACE/relibc/              upstream relibc, made by tools/get-relibc
+  WORKSPACE/sculpt-declarative/  (optional, for "In Sculpt" in the README)
+  WORKSPACE/goa/                 (optional, needed by sculpt-declarative)
+
+This repository holds only what Genode adds to relibc. tools/get-relibc
+clones upstream relibc beside it (WORKSPACE/relibc, or $RELIBC_DIR) and
+applies this repository's patches and platform module to that checkout.
+
+
+2. Host packages
+----------------
+
+Debian 12 or Ubuntu 24.04 (the systems Genode's tool chain is built for):
+
+  sudo apt install git make gcc g++ binutils flex bison gperf m4 pkg-config \
+       zlib1g-dev libelf-dev libexpat1-dev libgmp-dev libncurses-dev \
+       autoconf autogen automake wget curl python3 gnupg mtools e2fsprogs \
+       e2tools gdisk libxml2-utils mawk expect tcl qemu-system-x86 \
+       xorriso grub-pc-bin bubblewrap
+
+On NixOS: tools/nixos/shell.nix, copied to WORKSPACE, gives an FHS shell with
+all of that ('cd WORKSPACE && nix-shell'); it mounts WORKSPACE/genode-tools
+as /usr/local/genode and WORKSPACE/goa as /usr/local/goa.
+
+Check: 'expect -v', 'qemu-system-x86_64 --version' and 'bwrap --version' work.
+
+
+3. Genode's tool chain (GCC 14.2, version 25.05)
+------------------------------------------------
+
+Pre-compiled (see genode/doc/tool_chain.txt for the checksums):
+
+  wget https://codeberg.org/genodelabs/genode/releases/download/25.05/genode-toolchain-25.05-ubuntu-24.04.tar.xz
+  sudo tar xPf genode-toolchain-25.05-ubuntu-24.04.tar.xz
+
+(or genode-toolchain-25.05-debian-12.10.tar.xz). This installs to
+/usr/local/genode/tool/25.05, where Genode's build system expects it. On
+NixOS, extract it into WORKSPACE/genode-tools instead (the shell mounts it
+there):
+
+  mkdir -p WORKSPACE/genode-tools
+  tar xf genode-toolchain-25.05-*.tar.xz --strip-components=3 -C WORKSPACE/genode-tools
+  ln -sfn 25.05 WORKSPACE/genode-tools/tool/current
+
+(the archive holds usr/local/genode/tool/25.05/...).
+
+Building it from source is 'genode/tool/tool_chain x86' (an hour or more).
+
+Check: /usr/local/genode/tool/25.05/bin/genode-x86-gcc --version says 14.2.
+
+
+4. Genode
+---------
+
+  cd WORKSPACE
+  git clone https://codeberg.org/genodelabs/genode.git
+  git -C genode checkout sculpt-26.04          # commit 96983743
+
+Ports (third-party sources) are prepared on demand: a build that lacks one
+stops with "Error: Ports not prepared or outdated" and names it. Prepare
+it with
+
+  genode/tool/ports/prepare_port <name> ...
+
+For the tests below: nova and grub2 (NOVA in QEMU), lwip and linux (the IP
+stacks lwip and lxip), stdcxx and expat. The applications
+(run/relibc_lighttpd_fetchurl.run) name theirs (lighttpd, curl, openssl,
+zlib, ...).
+
+  genode/tool/ports/prepare_port nova grub2 lwip linux stdcxx expat
+
+
+5. Rust (for relibc) and cbindgen (for relibc's C headers)
+----------------------------------------------------------
+
+rustup (https://rustup.rs, or the distribution's package), then relibc's
+toolchain, which WORKSPACE/relibc/rust-toolchain.toml names:
+
+  rustup toolchain install nightly-2026-05-24 --component rust-src
+
+cbindgen, into this repository (tools/build-relibc looks there):
+
+  cd WORKSPACE/relibc-genode
+  cargo install --root var/tools cbindgen --version 0.29.4
+
+(CBINDGEN=/path/to/cbindgen uses another one.)
+
+
+6. relibc for Genode
+--------------------
+
+  cd WORKSPACE/relibc-genode
+  tools/get-relibc        # clone relibc (with openlibm, dlmalloc-rs) to ../relibc, patch it
+  tools/build-relibc      # librelibc.a, libopenlibm.a, headers into var/relibc/
+
+Expected: "applied: relibc-fixes.patch relibc-genode.patch", then
+var/relibc/{librelibc.a,libopenlibm.a,include}.
+
+relibc's changes stay in this repository: relibc/src/platform/genode (the
+platform module, copied into the checkout) and patches/ (the few lines
+outside it). After editing the checkout, 'tools/save-relibc' copies them
+back (see the README, "Layout").
+
+
+7. A build directory with relibc as the libc
+--------------------------------------------
+
+  cd WORKSPACE/genode
+  ./tool/create_builddir x86_64 BUILD_DIR=build/x86_64_relibc
+
+In build/x86_64_relibc/etc/build.conf, uncomment:
+
+  KERNEL ?= nova                  (the default kernel for 'make run/...')
+  MAKE += -j<cores>
+  QEMU_OPT += -accel kvm          (if /dev/kvm exists)
+  the 'REPOSITORIES +=' lines of the optional repositories (libports,
+  ports, dde_linux, dde_rump, gems, pc, dde_bsd, dde_ipxe)
+
+and add at the end, so that this repository comes first and its libc wins:
+
+  REPOSITORIES := $(GENODE_DIR)/../relibc-genode $(REPOSITORIES)
+
+Build the libraries and the ABI lists:
+
+  cd build/x86_64_relibc
+  make lib/libc lib/posix lib/libm
+  ../../../relibc-genode/tools/mk-symbols $PWD
+
+Expected: "lib/symbols/libc: 15xx symbols" (and no change in git status of
+relibc-genode when nothing was changed).
+
+
+8. Tests
+--------
+
+In build/x86_64_relibc. base-linux needs no QEMU:
+
+  make run/relibc_posix   KERNEL=linux BOARD=linux   # "relibc posix: all checks passed"
+  make run/relibc_process KERNEL=linux BOARD=linux   # "relibc process: all checks passed"
+  make run/pkg_test TEST=test-libc_fork KERNEL=linux BOARD=linux
+
+NOVA in QEMU (the build directory's default kernel):
+
+  make run/relibc_process
+
+Genode's own test packages run with run/pkg_test.run (TEST=test-pthread,
+test-libc_vfs, test-tcp_bulk_lwip, ...; the README lists those that pass).
+
+A timed-out base-linux run can leave Genode's processes behind; end them by
+their pid (pgrep -x core; pgrep -x expect), not with 'pkill -f', whose
+pattern also matches the shell that runs it.
+
+
+9. Genode's libc next to relibc (optional)
+------------------------------------------
+
+Programs can also link relibc statically ('LIBS += relibc_genode') in a
+build directory with Genode's own libc (repos/libports' libc port:
+prepare_port libc). There, this repository comes last:
+
+  REPOSITORIES += $(GENODE_DIR)/../relibc-genode
+
+  make run/relibc_posix          # in that build directory

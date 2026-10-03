@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+#
+# Write the ABI symbol lists (lib/symbols/{libc,libm,posix}) of the drop-in
+# libc from the shared libraries of a relibc build directory, with Genode's
+# tool/abi_symbols. Kept: C symbols, and the C++ entry points of Genode's
+# libc API (Libc::, Component::). Left out: relibc's Rust internals, the
+# shim's internals and its gxd_* interface.
+#
+#   tools/mk-symbols GENODE_BUILD_DIR
+#
+set -e
+here=$(cd "$(dirname "$0")/.." && pwd)
+build=${1:?usage: tools/mk-symbols GENODE_BUILD_DIR}
+abi_symbols="$build/../../tool/abi_symbols"
+mkdir -p "$here/lib/symbols"
+for lib in libc posix libm; do
+	so="$build/var/libcache/$lib/$lib.lib.so"
+	"$abi_symbols" "$so" \
+	| grep -v '^# Please review' \
+	| awk '/^#/ || /^$/ { next }
+	       $2 == "A"                  { next }   # absolute (the init/fini --defsyms)
+	       $1 ~ /^_R/                 { next }   # Rust v0 mangling
+	       $1 ~ /17h[0-9a-f]+E$/      { next }   # Rust legacy mangling
+	       $1 ~ /^gxd_/               { next }   # the shim interface
+	       $1 == "__gnu_Unwind_Find_exidx" || $1 == "dl_unwind_find_exidx" { next }  # in every shared lib
+	       $1 ~ /^_Z/ && $1 !~ /^_ZN(4Libc|9Component)/ { next }
+	       { print }' \
+	> "$here/lib/symbols/$lib"
+	# as in libports' list: libc calls the program's Libc::Component::construct,
+	# which keeps the program from dropping it (-gc-sections) and exports it
+	if [ "$lib" = libc ]; then
+		echo "_ZN4Libc9Component9constructERNS_3EnvE U" >> "$here/lib/symbols/$lib"
+	fi
+	# as in libports' list: the C++ runtime ABI of ld.lib.so (__cxa_*,
+	# typeinfo, ...), for programs that link libc but not ld (LIBS = posix ...)
+	if [ "$lib" = libc ]; then
+		repos="$build/../../repos"
+		comm -12 <(awk '!/^#/ && NF {print $1}' "$repos/libports/lib/symbols/libc" | sort -u) \
+		         <(awk '!/^#/ && NF {print $1}' "$repos/base/lib/symbols/ld" | sort -u) \
+		| comm -23 - <(awk '{print $1}' "$here/lib/symbols/$lib" | sort -u) > "$here/lib/symbols/.cxx"
+		grep -Fwf "$here/lib/symbols/.cxx" "$repos/libports/lib/symbols/libc" \
+		| awk 'NR == FNR { want[$1]; next } ($1 in want)' "$here/lib/symbols/.cxx" - >> "$here/lib/symbols/$lib"
+		rm -f "$here/lib/symbols/.cxx"
+	fi
+	# likewise posix calls the program's main
+	if [ "$lib" = posix ]; then
+		echo "main U" >> "$here/lib/symbols/$lib"
+	fi
+	echo "lib/symbols/$lib: $(wc -l < "$here/lib/symbols/$lib") symbols"
+done

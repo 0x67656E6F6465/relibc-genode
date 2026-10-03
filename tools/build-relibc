@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+#
+# Build relibc for Genode (the 'genode' feature: relibc's Linux ABI, system
+# calls through the Genode shim) and put librelibc.a where the Genode build
+# finds it (var/relibc/). RELIBC_DIR defaults to ../relibc (beside
+# this repository), as tools/get-relibc makes it; the toolchain is relibc's rust-toolchain.toml
+# (through rustup).
+#
+set -e
+here=$(cd "$(dirname "$0")/.." && pwd)
+relibc=${RELIBC_DIR:-$here/../relibc}
+channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' "$relibc/rust-toolchain.toml")
+bin=$(dirname "$(rustup +"$channel" which cargo)")
+
+cd "$relibc"
+# The time zones built in (named ones, POSIX TZ strings need none): every
+# component holds a copy of their 1 MiB table in RAM otherwise
+export CHRONO_TZ_TIMEZONE_FILTER=${RELIBC_TIMEZONES:-'^(UTC|Etc/.*)$'}
+
+PATH="$bin:$PATH" RUSTC="$bin/rustc" RUSTFLAGS="-Z tls-model=emulated ${RELIBC_RUSTFLAGS}" \
+	cargo build --release --features genode \
+	      -Z build-std=core,alloc,compiler_builtins --target x86_64-unknown-linux-gnu
+mkdir -p "$here/var/relibc"
+cp target/x86_64-unknown-linux-gnu/release/librelibc.a "$here/var/relibc/"
+
+
+# C headers, as relibc's 'make headers' writes them (cbindgen, see README)
+inc="$here/var/relibc/include"
+cbindgen=${CBINDGEN:-$here/var/tools/bin/cbindgen}
+rm -rf "$inc" && mkdir -p "$inc"
+cp -r include/* "$inc/"
+cp openlibm/include/*.h openlibm/src/*.h "$inc/"
+# (math.h is openlibm's, as in relibc's Makefile without USE_RUST_LIBM)
+for dir in $(find src/header -mindepth 1 -maxdepth 1 -type d -not -name "_*" -not -name math -printf "%f\n"); do
+	[ -f "src/header/$dir/cbindgen.toml" ] || continue
+	out="$inc/$(echo "$dir" | sed 's/_/\//g').h"
+	mkdir -p "$(dirname "$out")"
+	# the Linux ABI by a macro of its own: ports configured for Genode's
+	# FreeBSD libc must not take their Linux code paths (see README)
+	cat "src/header/$dir/cbindgen.toml" cbindgen.globdefs.toml \
+		| sed 's/"target_os=linux" = "__linux__"/"target_os=linux" = "__relibc_linux_abi__"/; s/\b__linux__\b/__relibc_linux_abi__/g' \
+		| PATH="$bin:$PATH" "$cbindgen" "src/header/$dir/mod.rs" --config=/dev/stdin --output "$out" 2>/dev/null \
+		|| echo "cbindgen failed for $dir" >&2
+done
+echo "$inc"
+
+# openlibm, relibc's math library, as relibc's Makefile builds it (and
+# position-independent, as part of libc.lib.so)
+rm -rf "$here/var/relibc/openlibm" && cp -r openlibm "$here/var/relibc/openlibm"
+make -s -C "$here/var/relibc/openlibm" libopenlibm.a CC=${CC:-gcc} \
+	CPPFLAGS="-fno-stack-protector -fPIC -I$relibc/include -I$inc" >/dev/null
+cp "$here/var/relibc/openlibm/libopenlibm.a" "$here/var/relibc/"
+echo "$here/var/relibc/libopenlibm.a"
+
+# compiler_builtins (in librelibc.a) brings weak, hidden copies of some math
+# functions (sqrt, fmod, ...). The most restrictive visibility wins, which
+# would hide openlibm's: make those copies local to their objects.
+both=$(comm -12 \
+	<(nm --defined-only "$here/var/relibc/librelibc.a" 2>/dev/null | awk '$2 ~ /^[WVTt]$/ {print $3}' | sort -u) \
+	<(nm --defined-only "$here/var/relibc/libopenlibm.a" 2>/dev/null | awk '$2 == "T" {print $3}' | sort -u))
+if [ -n "$both" ]; then
+	objcopy $(for s in $both; do printf -- '--localize-symbol=%s ' "$s"; done) "$here/var/relibc/librelibc.a"
+	echo "made local in librelibc.a (openlibm provides them): $(echo $both | wc -w) symbols"
+fi

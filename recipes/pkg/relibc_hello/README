@@ -1,0 +1,1 @@
+A C program on relibc (Redox's C library, in Rust) instead of Genode's libc: it prints, allocates, sleeps and uses a file in its VFS, then exits.

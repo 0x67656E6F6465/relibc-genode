@@ -1,0 +1,1093 @@
+diff --git a/include/features.h b/include/features.h
+index cd3aced4..e14d66d6 100644
+--- a/include/features.h
++++ b/include/features.h
+@@ -78,7 +78,8 @@
+ 
+ // Analogous to Rust's Never type
+ //TODO: clang fails to compile C with [[noreturn]]
+-#if defined(__cplusplus) && __HAS_ATTRIBUTE(noreturn) && !(__clang__)
++// GCC: the attribute, since cbindgen places __noreturn where C++ allows no [[noreturn]]
++#if defined(__cplusplus) && __HAS_ATTRIBUTE(noreturn) && !(__clang__) && !defined(__GNUC__)
+     #define __noreturn [[noreturn]]
+ // #elif __STDC_VERSION__ >= 201112L
+ // FIXME: cbindgen incorrectly places _Noreturn
+diff --git a/src/c/math.c b/src/c/math.c
+new file mode 100644
+index 00000000..80b3feeb
+--- /dev/null
++++ b/src/c/math.c
+@@ -0,0 +1,10 @@
++/* the BSDs' and glibc's (obsolete) names of isfinite: in C, as math.h is
++   openlibm's or relibc's (math_libm) */
++
++int finite(double x) {
++    return __builtin_isfinite(x);
++}
++
++int finitef(float x) {
++    return __builtin_isfinite(x);
++}
+diff --git a/src/c/wchar.c b/src/c/wchar.c
+new file mode 100644
+index 00000000..a458bcde
+--- /dev/null
++++ b/src/c/wchar.c
+@@ -0,0 +1,7 @@
++typedef __WCHAR_TYPE__ wchar_t;
++
++double wcstod(const wchar_t *nptr, wchar_t **endptr);
++
++long double wcstold(const wchar_t *nptr, wchar_t **endptr) {
++    return (long double)wcstod(nptr, endptr);
++}
+diff --git a/src/header/fcntl/linux.rs b/src/header/fcntl/linux.rs
+index 4dff8e23..90772727 100644
+--- a/src/header/fcntl/linux.rs
++++ b/src/header/fcntl/linux.rs
+@@ -2,7 +2,7 @@ use crate::platform::types::c_int;
+ 
+ /// Close the file descriptor upon execution of an `exec` family function and
+ /// in the new process image created by `posix_spawn()` or `posix_spawnp()`.
+-pub const FD_CLOEXEC: c_int = 0x8_0000;
++pub const FD_CLOEXEC: c_int = 1;
+ 
+ // Flags for capability based "at" functions {
+ /// Use the current working directory to determine the target of relative file
+diff --git a/src/header/mod.rs b/src/header/mod.rs
+index cf6651d4..75d52f93 100644
+--- a/src/header/mod.rs
++++ b/src/header/mod.rs
+@@ -134,6 +134,7 @@ pub mod pwd;
+ pub mod regex;
+ // TODO: regexp.h (deprecated)
+ pub mod sched;
++pub mod search;
+ // TODO: search.h
+ pub mod semaphore;
+ pub mod setjmp;
+diff --git a/src/header/net_if/mod.rs b/src/header/net_if/mod.rs
+index 6828b35c..5cae6732 100644
+--- a/src/header/net_if/mod.rs
++++ b/src/header/net_if/mod.rs
+@@ -53,16 +53,18 @@ pub unsafe extern "C" fn if_freenameindex(_s: *mut if_nameindex) {}
+ /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/if_indextoname.html>.
+ ///
+ /// # Safety
+-/// Returns only static lifetime references to const names, does not reuse the buf pointer.
++/// As POSIX, copies the name to 'buf' (at least IF_NAMESIZE bytes) and returns it.
+ /// Returns NULL in case of not found + ERRNO being set to ENXIO.
+ /// Currently only checks against inteface index 1.
+ #[unsafe(no_mangle)]
+-pub unsafe extern "C" fn if_indextoname(idx: c_uint, _buf: *mut c_char) -> *const c_char {
++pub unsafe extern "C" fn if_indextoname(idx: c_uint, buf: *mut c_char) -> *mut c_char {
+     if idx == 1 {
+-        return IF_STUB_INTERFACE;
++        let name = c"stub".to_bytes_with_nul();
++        unsafe { core::ptr::copy_nonoverlapping(name.as_ptr().cast(), buf, name.len()) };
++        return buf;
+     }
+     ERRNO.set(ENXIO);
+-    null::<c_char>()
++    core::ptr::null_mut()
+ }
+ 
+ /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/if_nameindex.html>.
+diff --git a/src/header/pthread/mod.rs b/src/header/pthread/mod.rs
+index ed1bc2a5..1a2bd246 100644
+--- a/src/header/pthread/mod.rs
++++ b/src/header/pthread/mod.rs
+@@ -37,7 +37,8 @@ pub(crate) struct RlctAttr {
+     _pad: [u8; 12],
+ }
+ 
+-pub const _POSIX_THREADS: c_int = 1;
++// _POSIX_THREADS is unistd.h's (POSIX); a second definition here would
++// conflict with it in programs that include both
+ 
+ pub const PTHREAD_BARRIER_SERIAL_THREAD: c_int = -1;
+ 
+diff --git a/src/header/pty/mod.rs b/src/header/pty/mod.rs
+index 1e3d1de0..5243fbd1 100644
+--- a/src/header/pty/mod.rs
++++ b/src/header/pty/mod.rs
+@@ -80,7 +80,7 @@ pub unsafe extern "C" fn openpty(
+     }
+ 
+     if !winp.is_null() {
+-        unsafe { sys_ioctl::ioctl(slave, sys_ioctl::TIOCSWINSZ, winp as *mut c_void) };
++        unsafe { sys_ioctl::ioctl_ptr(slave, sys_ioctl::TIOCSWINSZ, winp as *mut c_void) };
+     }
+ 
+     unsafe { *amaster = master };
+diff --git a/src/header/search/cbindgen.toml b/src/header/search/cbindgen.toml
+new file mode 100644
+index 00000000..e23a38a5
+--- /dev/null
++++ b/src/header/search/cbindgen.toml
+@@ -0,0 +1,13 @@
++# POSIX header spec: https://pubs.opengroup.org/onlinepubs/9799919799/basedefs/search.h.html
++#
++# Spec quotations relating to includes:
++# - "The <search.h> header shall define the size_t type as described in <sys/types.h>."
++sys_includes = ["stddef.h"]
++include_guard = "_RELIBC_SEARCH_H"
++language = "C"
++style = "Type"
++no_includes = true
++cpp_compat = true
++
++[enum]
++prefix_with_name = false
+diff --git a/src/header/search/mod.rs b/src/header/search/mod.rs
+new file mode 100644
+index 00000000..a93e8b7f
+--- /dev/null
++++ b/src/header/search/mod.rs
+@@ -0,0 +1,232 @@
++//! `search.h` implementation: the binary search trees (tsearch and
++//! friends), as an AVL tree.
++//!
++//! See <https://pubs.opengroup.org/onlinepubs/9799919799/basedefs/search.h.html>.
++
++use core::ptr;
++
++use alloc::boxed::Box;
++
++use crate::platform::types::{c_int, c_void};
++
++/// See <https://pubs.opengroup.org/onlinepubs/9799919799/basedefs/search.h.html>.
++#[repr(C)]
++#[derive(Clone, Copy, PartialEq, Eq)]
++pub enum VISIT {
++    preorder,
++    postorder,
++    endorder,
++    leaf,
++}
++
++/// The comparison function of the trees (not a type of search.h).
++/// cbindgen:ignore
++type Compar = Option<unsafe extern "C" fn(*const c_void, *const c_void) -> c_int>;
++
++/// A node. As POSIX requires, it begins with the pointer to its key, as the
++/// functions return pointers to nodes, which callers dereference as `void **`.
++/// cbindgen:ignore
++#[repr(C)]
++struct Node {
++    key: *const c_void,
++    child: [*mut Node; 2],
++    height: c_int,
++}
++
++fn height(n: *mut Node) -> c_int {
++    if n.is_null() { 0 } else { unsafe { (*n).height } }
++}
++
++unsafe fn update(n: *mut Node) {
++    unsafe { (*n).height = 1 + height((*n).child[0]).max(height((*n).child[1])) };
++}
++
++/// Rotate so that the `dir` child becomes the root.
++unsafe fn rotate(n: *mut Node, dir: usize) -> *mut Node {
++    unsafe {
++        let c = (*n).child[dir];
++        (*n).child[dir] = (*c).child[1 - dir];
++        (*c).child[1 - dir] = n;
++        update(n);
++        update(c);
++        c
++    }
++}
++
++unsafe fn balance(n: *mut Node) -> *mut Node {
++    unsafe {
++        update(n);
++        let diff = height((*n).child[1]) - height((*n).child[0]);
++        if diff.abs() <= 1 {
++            return n;
++        }
++        let dir = (diff > 0) as usize; /* the heavy side */
++        let c = (*n).child[dir];
++        if height((*c).child[1 - dir]) > height((*c).child[dir]) {
++            (*n).child[dir] = rotate(c, 1 - dir);
++        }
++        rotate(n, dir)
++    }
++}
++
++unsafe fn compare(compar: Compar, a: *const c_void, b: *const c_void) -> c_int {
++    unsafe { compar.expect("search.h: no comparison function")(a, b) }
++}
++
++/// Insert `key` below `n` unless present; `found`: the node of the key.
++unsafe fn insert(n: *mut Node, key: *const c_void, compar: Compar, found: &mut *mut Node) -> *mut Node {
++    unsafe {
++        if n.is_null() {
++            let node = Box::into_raw(Box::new(Node { key, child: [ptr::null_mut(); 2], height: 1 }));
++            *found = node;
++            return node;
++        }
++        let c = compare(compar, key, (*n).key);
++        if c == 0 {
++            *found = n;
++            return n;
++        }
++        let dir = (c > 0) as usize;
++        (*n).child[dir] = insert((*n).child[dir], key, compar, found);
++        balance(n)
++    }
++}
++
++/// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/tsearch.html>.
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn tsearch(key: *const c_void, rootp: *mut *mut c_void, compar: Option<unsafe extern "C" fn(*const c_void, *const c_void) -> c_int>) -> *mut c_void {
++    if rootp.is_null() {
++        return ptr::null_mut();
++    }
++    let mut found = ptr::null_mut();
++    unsafe { *rootp = insert((*rootp).cast(), key, compar, &mut found).cast() };
++    found.cast()
++}
++
++/// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/tfind.html>.
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn tfind(key: *const c_void, rootp: *const *mut c_void, compar: Option<unsafe extern "C" fn(*const c_void, *const c_void) -> c_int>) -> *mut c_void {
++    if rootp.is_null() {
++        return ptr::null_mut();
++    }
++    let mut n: *mut Node = unsafe { (*rootp).cast() };
++    while !n.is_null() {
++        let c = unsafe { compare(compar, key, (*n).key) };
++        if c == 0 {
++            return n.cast();
++        }
++        n = unsafe { (*n).child[(c > 0) as usize] };
++    }
++    ptr::null_mut()
++}
++
++/// Remove the leftmost node below `n` into `min`.
++unsafe fn remove_min(n: *mut Node, min: &mut *mut Node) -> *mut Node {
++    unsafe {
++        if (*n).child[0].is_null() {
++            *min = n;
++            return (*n).child[1];
++        }
++        (*n).child[0] = remove_min((*n).child[0], min);
++        balance(n)
++    }
++}
++
++/// Delete `key` below `n`; `parent` of the deleted node into `result`.
++unsafe fn delete(
++    n: *mut Node,
++    key: *const c_void,
++    compar: Compar,
++    parent: *mut Node,
++    result: &mut *mut Node,
++    deleted: &mut bool,
++) -> *mut Node {
++    unsafe {
++        if n.is_null() {
++            return n;
++        }
++        let c = compare(compar, key, (*n).key);
++        if c != 0 {
++            let dir = (c > 0) as usize;
++            (*n).child[dir] = delete((*n).child[dir], key, compar, n, result, deleted);
++            return balance(n);
++        }
++        *deleted = true;
++        *result = parent;
++        let (l, r) = ((*n).child[0], (*n).child[1]);
++        drop(Box::from_raw(n));
++        if r.is_null() {
++            return l;
++        }
++        let mut min = ptr::null_mut();
++        let r = remove_min(r, &mut min);
++        (*min).child = [l, r];
++        balance(min)
++    }
++}
++
++/// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/tdelete.html>.
++///
++/// Returns the parent of the deleted node; deleting the root, for which
++/// POSIX leaves the value unspecified, the (non-null) `rootp`.
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn tdelete(key: *const c_void, rootp: *mut *mut c_void, compar: Option<unsafe extern "C" fn(*const c_void, *const c_void) -> c_int>) -> *mut c_void {
++    if rootp.is_null() || unsafe { (*rootp).is_null() } {
++        return ptr::null_mut();
++    }
++    let (mut result, mut deleted) = (ptr::null_mut(), false);
++    unsafe {
++        *rootp = delete((*rootp).cast(), key, compar, ptr::null_mut(), &mut result, &mut deleted).cast();
++    }
++    if !deleted {
++        ptr::null_mut()
++    } else if result.is_null() {
++        rootp.cast()
++    } else {
++        result.cast()
++    }
++}
++
++
++unsafe fn walk(n: *const Node, action: unsafe extern "C" fn(*const c_void, VISIT, c_int), depth: c_int) {
++    if n.is_null() {
++        return;
++    }
++    unsafe {
++        let [l, r] = (*n).child;
++        if l.is_null() && r.is_null() {
++            action(n.cast(), VISIT::leaf, depth);
++            return;
++        }
++        action(n.cast(), VISIT::preorder, depth);
++        walk(l, action, depth + 1);
++        action(n.cast(), VISIT::postorder, depth);
++        walk(r, action, depth + 1);
++        action(n.cast(), VISIT::endorder, depth);
++    }
++}
++
++/// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/twalk.html>.
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn twalk(root: *const c_void, action: Option<unsafe extern "C" fn(*const c_void, VISIT, c_int)>) {
++    if let Some(action) = action {
++        unsafe { walk(root.cast(), action, 0) };
++    }
++}
++
++/// Non-POSIX, glibc's: free the tree, its keys through `free_node`.
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn tdestroy(root: *mut c_void, free_node: Option<unsafe extern "C" fn(*mut c_void)>) {
++    let n: *mut Node = root.cast();
++    if n.is_null() {
++        return;
++    }
++    unsafe {
++        tdestroy((*n).child[0].cast(), free_node);
++        tdestroy((*n).child[1].cast(), free_node);
++        if let Some(free_node) = free_node {
++            free_node((*n).key.cast_mut());
++        }
++        drop(Box::from_raw(n));
++    }
++}
+diff --git a/src/header/signal/cbindgen.toml b/src/header/signal/cbindgen.toml
+index 76fe71be..98d61014 100644
+--- a/src/header/signal/cbindgen.toml
++++ b/src/header/signal/cbindgen.toml
+@@ -36,7 +36,7 @@ after_includes = """
+ typedef struct siginfo siginfo_t;
+ typedef struct ucontext ucontext_t;
+ typedef struct mcontext mcontext_t;
+-typedef long sig_atomic_t;
++typedef int sig_atomic_t;  /* as glibc */
+ 
+ struct sigaction {
+   union {
+diff --git a/src/header/stdio/mod.rs b/src/header/stdio/mod.rs
+index e9267706..034b19b5 100644
+--- a/src/header/stdio/mod.rs
++++ b/src/header/stdio/mod.rs
+@@ -661,6 +661,12 @@ pub unsafe extern "C" fn fileno(stream: *mut FILE) -> c_int {
+     *stream.file
+ }
+ 
++/// Non-POSIX, as glibc's and the BSDs': [`fileno`] without locking the stream.
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn fileno_unlocked(stream: *mut FILE) -> c_int {
++    unsafe { *(*stream).file }
++}
++
+ /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/flockfile.html>.
+ ///
+ /// Lock the file
+diff --git a/src/header/stdio/printf.rs b/src/header/stdio/printf.rs
+index b1630bc4..c81a6a94 100644
+--- a/src/header/stdio/printf.rs
++++ b/src/header/stdio/printf.rs
+@@ -4,7 +4,7 @@ use alloc::{
+     string::{String, ToString},
+     vec::Vec,
+ };
+-use core::{cmp, ffi::VaList, fmt, num::FpCategory, ops::Range, slice};
++use core::{ffi::VaList, fmt, num::FpCategory, ops::Range, slice};
+ 
+ use crate::{
+     c_str::{self, CStr, NulStr},
+@@ -56,6 +56,7 @@ pub(crate) enum FmtKind {
+     Scientific,
+     Decimal,
+     AnyNotation,
++    HexFloat,
+ 
+     String,
+     Char,
+@@ -153,10 +154,10 @@ impl VaArg {
+                 VaArg::ssize_t(unsafe { ap.next_arg::<ssize_t>() })
+             }
+ 
+-            (FmtKind::AnyNotation | FmtKind::Decimal | FmtKind::Scientific, IntKind::LongLong) => {
++            (FmtKind::AnyNotation | FmtKind::Decimal | FmtKind::Scientific | FmtKind::HexFloat, IntKind::LongLong) => {
+                 VaArg::c_longdouble(unsafe { VaArg::extract_longdouble(ap) })
+             }
+-            (FmtKind::AnyNotation | FmtKind::Decimal | FmtKind::Scientific, _) => {
++            (FmtKind::AnyNotation | FmtKind::Decimal | FmtKind::Scientific | FmtKind::HexFloat, _) => {
+                 VaArg::c_double(unsafe { ap.next_arg::<c_double>() })
+             }
+ 
+@@ -318,10 +319,10 @@ impl VaArg {
+                 VaArg::ssize_t(unsafe { untyped.ssize_t })
+             }
+ 
+-            (FmtKind::AnyNotation | FmtKind::Decimal | FmtKind::Scientific, IntKind::LongLong) => {
++            (FmtKind::AnyNotation | FmtKind::Decimal | FmtKind::Scientific | FmtKind::HexFloat, IntKind::LongLong) => {
+                 VaArg::c_longdouble(unsafe { untyped.c_longdouble })
+             }
+-            (FmtKind::AnyNotation | FmtKind::Decimal | FmtKind::Scientific, _) => {
++            (FmtKind::AnyNotation | FmtKind::Decimal | FmtKind::Scientific | FmtKind::HexFloat, _) => {
+                 VaArg::c_double(unsafe { untyped.c_double })
+             }
+ 
+@@ -493,7 +494,8 @@ fn float_exp(mut float: c_double) -> (c_double, isize) {
+         float /= 10.0;
+         exp += 1;
+     }
+-    while f64::EPSILON < float.abs() && float.abs() < 1.0 {
++    // any non-zero value: values below f64::EPSILON have exponents, too
++    while float != 0.0 && float.abs() < 1.0 {
+         float *= 10.0;
+         exp -= 1;
+     }
+@@ -600,6 +602,109 @@ fn fmt_float_nonfinite<W: Write>(
+     Ok(())
+ }
+ 
++/// A finite floating-point value as %a prints it: leading digit (1, or 0
++/// for zero and subnormals), the fraction bits, and the binary exponent
++struct HexFloat {
++    negative:  bool,
++    lead:      u8,
++    frac:      u128,
++    frac_bits: u32,
++    exp:       i32,
++}
++
++impl HexFloat {
++    fn from_f64(f: c_double) -> Option<HexFloat> {
++        if !f.is_finite() {
++            return None;
++        }
++        let bits = f.to_bits();
++        let negative = bits >> 63 != 0;
++        let e = ((bits >> 52) & 0x7ff) as i32;
++        let m = (bits & ((1 << 52) - 1)) as u128;
++        Some(match (e, m) {
++            (0, 0) => HexFloat { negative, lead: 0, frac: 0, frac_bits: 52, exp: 0 },
++            (0, _) => HexFloat { negative, lead: 0, frac: m, frac_bits: 52, exp: -1022 },
++            _      => HexFloat { negative, lead: 1, frac: m, frac_bits: 52, exp: e - 1023 },
++        })
++    }
++
++    /// An x86 80-bit long double (relibc passes its bit pattern), exactly
++    #[cfg(target_arch = "x86_64")]
++    fn from_longdouble(raw: c_longdouble) -> Option<HexFloat> {
++        let m = raw as u64;
++        let se = (raw >> 64) as u16;
++        let negative = se >> 15 != 0;
++        let e = (se & 0x7fff) as i32;
++        let frac = (m & ((1 << 63) - 1)) as u128;
++        let lead = (m >> 63) as u8;
++        Some(match e {
++            0x7fff => return None,
++            0 if m == 0 => HexFloat { negative, lead: 0, frac: 0, frac_bits: 63, exp: 0 },
++            0 => HexFloat { negative, lead, frac, frac_bits: 63, exp: -16382 },
++            _ => HexFloat { negative, lead, frac, frac_bits: 63, exp: e - 16383 },
++        })
++    }
++
++    #[cfg(not(target_arch = "x86_64"))]
++    fn from_longdouble(raw: c_longdouble) -> Option<HexFloat> {
++        HexFloat::from_f64(unsafe { relibc_ldtod(&raw const raw) })
++    }
++
++    /// Everything after "0x": digits, point, 'p' and exponent
++    fn string(&self, precision: Option<usize>, upper: bool, alternate: bool) -> String {
++        let digits = self.frac_bits.div_ceil(4) as usize;
++        let mut frac = self.frac << (digits as u32 * 4 - self.frac_bits);
++        let mut lead = self.lead;
++        let mut exp = self.exp;
++        let mut ndigits = digits;
++
++        if let Some(p) = precision {
++            if p < digits {
++                // round half to even at the last kept digit
++                let drop = ((digits - p) * 4) as u32;
++                let rest = frac & ((1u128 << drop) - 1);
++                let half = 1u128 << (drop - 1);
++                frac >>= drop;
++                let odd = if p == 0 { lead & 1 == 1 } else { frac & 1 == 1 };
++                if rest > half || (rest == half && odd) {
++                    frac += 1;
++                    if p == 0 || frac >> (p * 4) != 0 {
++                        frac = 0;
++                        lead += 1;
++                        if lead == 2 {
++                            lead = 1;
++                            exp += 1;
++                        }
++                    }
++                }
++            } else {
++                frac <<= ((p - digits) * 4) as u32;
++            }
++            ndigits = p;
++        } else {
++            // the shortest exact form: no trailing zeros
++            while ndigits > 0 && frac & 0xf == 0 {
++                frac >>= 4;
++                ndigits -= 1;
++            }
++        }
++
++        let mut out = String::new();
++        out.push((b'0' + lead) as char);
++        if ndigits > 0 || alternate {
++            out.push('.');
++        }
++        for i in (0..ndigits).rev() {
++            let d = ((frac >> (i * 4)) & 0xf) as u8;
++            let c = if d < 10 { b'0' + d } else if upper { b'A' + d - 10 } else { b'a' + d - 10 };
++            out.push(c as char);
++        }
++        out.push(if upper { 'P' } else { 'p' });
++        out.push_str(&format!("{:+}", exp));
++        out
++    }
++}
++
+ #[derive(Clone, Copy)]
+ pub(crate) struct PrintfIter<'a, T: c_str::Kind> {
+     pub(crate) format: NulStr<'a, T>,
+@@ -715,6 +820,7 @@ impl<'a, T: c_str::Kind> Iterator for PrintfIter<'a, T> {
+             'e' | 'E' => FmtKind::Scientific,
+             'f' | 'F' | 'L' => FmtKind::Decimal,
+             'g' | 'G' => FmtKind::AnyNotation,
++            'a' | 'A' => FmtKind::HexFloat,
+             's' => FmtKind::String,
+             'c' => FmtKind::Char,
+             'p' => FmtKind::Pointer,
+@@ -857,8 +963,8 @@ pub(crate) unsafe fn inner_printf<T: c_str::Kind>(
+         let fmtcase = match fmt {
+             'b' if T::IS_THIN_NOT_WIDE => Some(FmtCase::Lower),
+             'B' if T::IS_THIN_NOT_WIDE => Some(FmtCase::Upper),
+-            'x' | 'f' | 'e' | 'g' => Some(FmtCase::Lower),
+-            'X' | 'F' | 'E' | 'G' => Some(FmtCase::Upper),
++            'x' | 'f' | 'e' | 'g' | 'a' => Some(FmtCase::Lower),
++            'X' | 'F' | 'E' | 'G' | 'A' => Some(FmtCase::Upper),
+             _ => None,
+         };
+ 
+@@ -1036,7 +1142,10 @@ pub(crate) unsafe fn inner_printf<T: c_str::Kind>(
+                     let (log, exp) = float_exp(float);
+                     // TODO: .is_uppercase()?
+                     let exp_fmt = if fmt as u32 & 32 == 32 { 'e' } else { 'E' };
+-                    let precision = precision.unwrap_or(6);
++                    let precision = match precision.unwrap_or(6) {
++                        0 => 1,
++                        p => p,
++                    };
+                     let use_exp_format = exp < -4 || exp >= precision as isize;
+ 
+                     if use_exp_format {
+@@ -1048,12 +1157,9 @@ pub(crate) unsafe fn inner_printf<T: c_str::Kind>(
+                             pad_space, pad_zero,
+                         )?;
+                     } else {
+-                        // Length of integral part will be the exponent of
+-                        // the unused logarithm, unless the exponent is
+-                        // negative which in case the integral part must
+-                        // of course be 0, 1 in length
+-                        let len = 1 + cmp::max(0, exp).cast_unsigned();
+-                        let precision = precision.saturating_sub(len);
++                        // C: with precision P and exponent X (P > X >= -4),
++                        // style f with precision P - 1 - X
++                        let precision = (precision as isize - 1 - exp).max(0) as usize;
+                         fmt_float_normal(
+                             w, !alternate, alternate, precision, float, left, pad_space, pad_zero,
+                         )?;
+@@ -1062,6 +1168,34 @@ pub(crate) unsafe fn inner_printf<T: c_str::Kind>(
+                     fmt_float_nonfinite(w, float, fmtcase.unwrap(), left, pad_space, pad_zero)?;
+                 }
+             }
++            FmtKind::HexFloat => {
++                let upper = matches!(fmtcase, Some(FmtCase::Upper));
++                let (value, float) = match unsafe {
++                    varargs.get(index, &mut ap, Some((arg.fmtkind, arg.intkind)))
++                } {
++                    VaArg::c_double(f) => (HexFloat::from_f64(f), f),
++                    VaArg::c_longdouble(raw) => {
++                        (HexFloat::from_longdouble(raw), unsafe { relibc_ldtod(&raw const raw) })
++                    }
++                    _ => panic!("this should not be possible"),
++                };
++                match value {
++                    Some(hex) => {
++                        let sign = if hex.negative { "-" } else if sign_always { "+" }
++                                   else if sign_reserve { " " } else { "" };
++                        let body = hex.string(precision, upper, alternate);
++                        let prefix = if upper { "0X" } else { "0x" };
++                        let len = sign.len() + prefix.len() + body.len();
++                        pad(w, !left, b' ', len..pad_space)?;
++                        w.write_all(sign.as_bytes())?;
++                        w.write_all(prefix.as_bytes())?;
++                        pad(w, true, b'0', len..pad_zero)?;
++                        w.write_all(body.as_bytes())?;
++                        pad(w, left, b' ', len..pad_space)?;
++                    }
++                    None => fmt_float_nonfinite(w, float, fmtcase.unwrap(), left, pad_space, pad_zero)?,
++                }
++            }
+             FmtKind::String => {
+                 let ptr = match unsafe {
+                     varargs.get(index, &mut ap, Some((arg.fmtkind, arg.intkind)))
+diff --git a/src/header/stdlib/mod.rs b/src/header/stdlib/mod.rs
+index 4d8db9a2..c0a9eee7 100644
+--- a/src/header/stdlib/mod.rs
++++ b/src/header/stdlib/mod.rs
+@@ -23,7 +23,7 @@ use crate::{
+         stdio::flush_io_streams,
+         stdlib::sort::{QsortContext, QsortRContext},
+         string::{strlen, strncmp},
+-        sys_ioctl::{TIOCGPTN, TIOCSPTLCK, ioctl},
++        sys_ioctl::{TIOCGPTN, TIOCSPTLCK, ioctl_ptr as ioctl},
+         time::constants::CLOCK_MONOTONIC,
+         unistd::{self, _SC_PAGESIZE, sysconf},
+         wchar::*,
+@@ -115,6 +115,46 @@ pub unsafe extern "C" fn a64l(s: *const c_char) -> c_long {
+     c_long::from(l)
+ }
+ 
++/// Non-POSIX, the BSDs' and glibc's: random bytes from the platform's
++/// source ([`Pal::getrandom`]), which do not run out.
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn arc4random_buf(buf: *mut c_void, nbytes: size_t) {
++    let buf = unsafe { slice::from_raw_parts_mut(buf.cast::<u8>(), nbytes) };
++    let mut done = 0;
++    while done < nbytes {
++        match Sys::getrandom(&mut buf[done..], 0) {
++            Ok(n) => done += n,
++            Err(Errno(EINTR)) => {}
++            // as glibc: there is no failure to report
++            Err(_) => intrinsics::abort(),
++        }
++    }
++}
++
++/// Non-POSIX, see [`arc4random_buf`].
++#[unsafe(no_mangle)]
++pub extern "C" fn arc4random() -> u32 {
++    let mut value = 0u32;
++    unsafe { arc4random_buf((&raw mut value).cast(), mem::size_of::<u32>()) };
++    value
++}
++
++/// Non-POSIX, see [`arc4random_buf`]: uniform in `[0, upper_bound)`.
++#[unsafe(no_mangle)]
++pub extern "C" fn arc4random_uniform(upper_bound: u32) -> u32 {
++    if upper_bound < 2 {
++        return 0;
++    }
++    // reject the values below 2^32 % upper_bound, which would bias the result
++    let min = upper_bound.wrapping_neg() % upper_bound;
++    loop {
++        let r = arc4random();
++        if r >= min {
++            return r % upper_bound;
++        }
++    }
++}
++
+ /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/abort.html>.
+ #[unsafe(no_mangle)]
+ pub unsafe extern "C" fn abort() -> ! {
+diff --git a/src/header/sys_ioctl/mod.rs b/src/header/sys_ioctl/mod.rs
+index 7f53d5f1..f80cc253 100644
+--- a/src/header/sys_ioctl/mod.rs
++++ b/src/header/sys_ioctl/mod.rs
+@@ -28,9 +28,17 @@ pub struct sgttyb {
+ /// Upon success, usually returns `0`. A few operations use the return value
+ /// as an output parameter and returns a nonnegative value on success. Upon
+ /// failure, `-1` is returned and errno set to indicate the error.
++///
++/// Variadic, as glibc's (and the Linux ABI's): the one argument there is, if
++/// any, is a pointer or an int, both passed in a register.
+ #[unsafe(no_mangle)]
+-pub unsafe extern "C" fn ioctl(fd: c_int, request: c_ulong, out: *mut c_void) -> c_int {
+-    // TODO: Somehow support varargs to syscall??
++pub unsafe extern "C" fn ioctl(fd: c_int, request: c_ulong, mut __valist: ...) -> c_int {
++    let out = unsafe { __valist.next_arg::<*mut c_void>() };
++    unsafe { ioctl_ptr(fd, request, out) }
++}
++
++/// `ioctl` with its argument, for relibc's own calls.
++pub unsafe fn ioctl_ptr(fd: c_int, request: c_ulong, out: *mut c_void) -> c_int {
+     #[cfg(target_os = "linux")]
+     unsafe {
+         crate::platform::Sys::ioctl(fd, request, out).or_minus_one_errno()
+diff --git a/src/header/sys_socket/mod.rs b/src/header/sys_socket/mod.rs
+index 3c32b9c6..9db80ac5 100644
+--- a/src/header/sys_socket/mod.rs
++++ b/src/header/sys_socket/mod.rs
+@@ -9,7 +9,7 @@ use crate::{
+     header::{bits_safamily_t::sa_family_t, sys_uio::iovec},
+     out::Out,
+     platform::{
+-        PalSocket, Sys,
++        self, Pal, PalSocket, Sys,
+         types::{c_char, c_int, c_long, c_uchar, c_uint, c_void, size_t, ssize_t},
+     },
+ };
+@@ -204,6 +204,45 @@ pub unsafe extern "C" fn accept(
+     )
+ }
+ 
++/// Non-POSIX, Linux's and the BSDs': [`accept`] with `SOCK_NONBLOCK` and
++/// `SOCK_CLOEXEC`, set on the new socket through `fcntl`.
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn accept4(
++    socket: c_int,
++    address: *mut sockaddr,
++    address_len: *mut socklen_t,
++    flags: c_int,
++) -> c_int {
++    use crate::header::fcntl::{F_GETFL, F_SETFD, F_SETFL, FD_CLOEXEC, O_NONBLOCK};
++    use constants::{SOCK_CLOEXEC, SOCK_NONBLOCK};
++
++    if flags & !(SOCK_NONBLOCK | SOCK_CLOEXEC) != 0 {
++        platform::ERRNO.set(crate::header::errno::EINVAL);
++        return -1;
++    }
++    let fd = unsafe { accept(socket, address, address_len) };
++    if fd < 0 {
++        return fd;
++    }
++    let set = || -> crate::error::Result<()> {
++        if flags & SOCK_CLOEXEC != 0 {
++            Sys::fcntl(fd, F_SETFD, FD_CLOEXEC as _)?;
++        }
++        if flags & SOCK_NONBLOCK != 0 {
++            let fl = Sys::fcntl(fd, F_GETFL, 0)?;
++            Sys::fcntl(fd, F_SETFL, (fl | O_NONBLOCK) as _)?;
++        }
++        Ok(())
++    };
++    match set() {
++        Ok(()) => fd,
++        Err(err) => {
++            let _ = Sys::close(fd);
++            Err::<c_int, _>(err).or_minus_one_errno()
++        }
++    }
++}
++
+ /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/bind.html>.
+ #[unsafe(no_mangle)]
+ pub unsafe extern "C" fn bind(
+diff --git a/src/header/termios/mod.rs b/src/header/termios/mod.rs
+index 5b2b324f..0057cfb7 100644
+--- a/src/header/termios/mod.rs
++++ b/src/header/termios/mod.rs
+@@ -102,7 +102,7 @@ pub struct termios {
+ /// indicate the error.
+ #[unsafe(no_mangle)]
+ pub unsafe extern "C" fn tcgetattr(fildes: c_int, termios_p: *mut termios) -> c_int {
+-    unsafe { sys_ioctl::ioctl(fildes, sys_ioctl::TCGETS, termios_p.cast::<c_void>()) }
++    unsafe { sys_ioctl::ioctl_ptr(fildes, sys_ioctl::TCGETS, termios_p.cast::<c_void>()) }
+ }
+ 
+ /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/tcsetattr.html>.
+@@ -122,7 +122,7 @@ pub unsafe extern "C" fn tcsetattr(
+         TCSANOW | TCSADRAIN | TCSAFLUSH => {
+             // This is safe because ioctl shouldn't modify the value
+             unsafe {
+-                sys_ioctl::ioctl(
++                sys_ioctl::ioctl_ptr(
+                     fildes,
+                     sys_ioctl::TCSETS + optional_actions as c_ulong,
+                     termios_p as *mut c_void,
+@@ -147,7 +147,7 @@ pub unsafe extern "C" fn tcsetattr(
+ #[unsafe(no_mangle)]
+ pub unsafe extern "C" fn tcgetsid(fildes: c_int) -> pid_t {
+     let mut sid = 0;
+-    if unsafe { sys_ioctl::ioctl(fildes, sys_ioctl::TIOCGSID, (&raw mut sid).cast::<c_void>()) } < 0
++    if unsafe { sys_ioctl::ioctl_ptr(fildes, sys_ioctl::TIOCGSID, (&raw mut sid).cast::<c_void>()) } < 0
+     {
+         return -1;
+     }
+@@ -285,7 +285,7 @@ pub unsafe extern "C" fn cfsetspeed(termios_p: *mut termios, speed: speed_t) ->
+ pub unsafe extern "C" fn tcflush(fildes: c_int, queue_selector: c_int) -> c_int {
+     match queue_selector {
+         TCIFLUSH | TCOFLUSH | TCIOFLUSH => unsafe {
+-            sys_ioctl::ioctl(fildes, sys_ioctl::TCFLSH, queue_selector as *mut c_void)
++            sys_ioctl::ioctl_ptr(fildes, sys_ioctl::TCFLSH, queue_selector as *mut c_void)
+         },
+         _ => {
+             platform::ERRNO.set(errno::EINVAL);
+@@ -303,7 +303,7 @@ pub unsafe extern "C" fn tcflush(fildes: c_int, queue_selector: c_int) -> c_int
+ /// indicate the error.
+ #[unsafe(no_mangle)]
+ pub unsafe extern "C" fn tcdrain(fildes: c_int) -> c_int {
+-    unsafe { sys_ioctl::ioctl(fildes, sys_ioctl::TCSBRK, core::ptr::dangling_mut()) }
++    unsafe { sys_ioctl::ioctl_ptr(fildes, sys_ioctl::TCSBRK, core::ptr::dangling_mut()) }
+ }
+ 
+ /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/tcsendbreak.html>.
+@@ -319,7 +319,7 @@ pub unsafe extern "C" fn tcdrain(fildes: c_int) -> c_int {
+ /// and assumed to be `0`. Matches behaviour of musl.
+ #[unsafe(no_mangle)]
+ pub unsafe extern "C" fn tcsendbreak(fildes: c_int, _duration: c_int) -> c_int {
+-    unsafe { sys_ioctl::ioctl(fildes, sys_ioctl::TCSBRK, core::ptr::null_mut()) }
++    unsafe { sys_ioctl::ioctl_ptr(fildes, sys_ioctl::TCSBRK, core::ptr::null_mut()) }
+ }
+ 
+ /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/tcgetwinsize.html>.
+@@ -331,7 +331,7 @@ pub unsafe extern "C" fn tcsendbreak(fildes: c_int, _duration: c_int) -> c_int {
+ /// indicate the error.
+ #[unsafe(no_mangle)]
+ pub unsafe extern "C" fn tcgetwinsize(fildes: c_int, winsize_p: *mut winsize) -> c_int {
+-    unsafe { sys_ioctl::ioctl(fildes, sys_ioctl::TIOCGWINSZ, winsize_p.cast()) }
++    unsafe { sys_ioctl::ioctl_ptr(fildes, sys_ioctl::TIOCGWINSZ, winsize_p.cast()) }
+ }
+ 
+ /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/tcsetwinsize.html>.
+@@ -348,7 +348,7 @@ pub unsafe extern "C" fn tcgetwinsize(fildes: c_int, winsize_p: *mut winsize) ->
+ /// `tcsgetwinsize()` on `fildes`.
+ #[unsafe(no_mangle)]
+ pub unsafe extern "C" fn tcsetwinsize(fildes: c_int, winsize_p: *const winsize) -> c_int {
+-    unsafe { sys_ioctl::ioctl(fildes, sys_ioctl::TIOCSWINSZ, winsize_p.cast_mut().cast()) }
++    unsafe { sys_ioctl::ioctl_ptr(fildes, sys_ioctl::TIOCSWINSZ, winsize_p.cast_mut().cast()) }
+ }
+ 
+ /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/tcflow.html>.
+@@ -362,7 +362,7 @@ pub unsafe extern "C" fn tcsetwinsize(fildes: c_int, winsize_p: *const winsize)
+ pub unsafe extern "C" fn tcflow(fildes: c_int, action: c_int) -> c_int {
+     match action {
+         TCIOFF | TCION | TCOOFF | TCOON => unsafe {
+-            sys_ioctl::ioctl(fildes, sys_ioctl::TCXONC, action as *mut _)
++            sys_ioctl::ioctl_ptr(fildes, sys_ioctl::TCXONC, action as *mut _)
+         },
+         _ => {
+             platform::ERRNO.set(errno::EINVAL);
+diff --git a/src/header/unistd/mod.rs b/src/header/unistd/mod.rs
+index aacbe98c..8843a44a 100644
+--- a/src/header/unistd/mod.rs
++++ b/src/header/unistd/mod.rs
+@@ -49,7 +49,7 @@ pub use crate::header::stdio::ctermid;
+ pub use crate::header::stdio::cuserid;
+ 
+ use super::{
+-    errno::{E2BIG, EINVAL, ENOMEM},
++    errno::{E2BIG, EINTR, EINVAL, ENOMEM},
+     stdio::snprintf,
+ };
+ 
+@@ -563,10 +563,26 @@ pub extern "C" fn getegid() -> gid_t {
+ }
+ 
+ /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/getentropy.html>.
+-// #[unsafe(no_mangle)]
+-#[expect(unused_variables, reason = "function not yet implemented")]
+-pub extern "C" fn getentropy(buffer: *mut c_void, length: size_t) -> c_int {
+-    unimplemented!();
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn getentropy(buffer: *mut c_void, length: size_t) -> c_int {
++    // At most 256 bytes, as POSIX says (GETENTROPY_MAX)
++    if length > 256 {
++        platform::ERRNO.set(EINVAL);
++        return -1;
++    }
++    let buf = unsafe { core::slice::from_raw_parts_mut(buffer.cast::<u8>(), length) };
++    let mut done = 0;
++    while done < length {
++        match Sys::getrandom(&mut buf[done..], 0) {
++            Ok(n) => done += n,
++            Err(Errno(EINTR)) => {}
++            Err(Errno(err)) => {
++                platform::ERRNO.set(err);
++                return -1;
++            }
++        }
++    }
++    0
+ }
+ 
+ /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/geteuid.html>.
+@@ -1251,7 +1267,7 @@ pub extern "C" fn sync() {
+ #[unsafe(no_mangle)]
+ pub extern "C" fn tcgetpgrp(fildes: c_int) -> pid_t {
+     let mut pgrp = 0;
+-    if unsafe { sys_ioctl::ioctl(fildes, sys_ioctl::TIOCGPGRP, (&raw mut pgrp).cast()) } < 0 {
++    if unsafe { sys_ioctl::ioctl_ptr(fildes, sys_ioctl::TIOCGPGRP, (&raw mut pgrp).cast()) } < 0 {
+         return -1;
+     }
+     pgrp
+@@ -1271,7 +1287,7 @@ pub extern "C" fn tcgetpgrp(fildes: c_int) -> pid_t {
+ /// indicate the error.
+ #[unsafe(no_mangle)]
+ pub extern "C" fn tcsetpgrp(fildes: c_int, pgid_id: pid_t) -> c_int {
+-    if unsafe { sys_ioctl::ioctl(fildes, sys_ioctl::TIOCSPGRP, &raw const pgid_id as _) } < 0 {
++    if unsafe { sys_ioctl::ioctl_ptr(fildes, sys_ioctl::TIOCSPGRP, &raw const pgid_id as _) } < 0 {
+         return -1;
+     }
+     pgid_id
+diff --git a/src/header/utmp/mod.rs b/src/header/utmp/mod.rs
+index 8512050b..6231bdd2 100644
+--- a/src/header/utmp/mod.rs
++++ b/src/header/utmp/mod.rs
+@@ -16,7 +16,7 @@ pub unsafe extern "C" fn login_tty(fd: c_int) -> c_int {
+     // Set controlling terminal
+     let mut arg: c_int = 0;
+     if unsafe {
+-        sys_ioctl::ioctl(
++        sys_ioctl::ioctl_ptr(
+             fd,
+             sys_ioctl::TIOCSCTTY,
+             core::ptr::from_mut::<c_int>(&mut arg).cast::<c_void>(),
+diff --git a/src/header/wchar/cbindgen.toml b/src/header/wchar/cbindgen.toml
+index 9bde4dc7..c5ceaf46 100644
+--- a/src/header/wchar/cbindgen.toml
++++ b/src/header/wchar/cbindgen.toml
+@@ -46,6 +46,24 @@ style = "Type"
+ no_includes = true
+ cpp_compat = true
+ 
++# wcstold is C (src/c/wchar.c): long double is not available in Rust
++trailer = """
++#ifndef _RELIBC_WCHAR_EXTRA_H
++#define _RELIBC_WCHAR_EXTRA_H
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++long double wcstold(const wchar_t *nptr, wchar_t **endptr);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
++"""
++
+ [export.rename]
+ "tm" = "struct tm"
+ 
+diff --git a/src/header/wchar/mod.rs b/src/header/wchar/mod.rs
+index 25b3be61..83c8c362 100644
+--- a/src/header/wchar/mod.rs
++++ b/src/header/wchar/mod.rs
+@@ -775,6 +775,12 @@ pub unsafe extern "C" fn wcsstr(ws1: *const wchar_t, ws2: *const wchar_t) -> *mu
+     }
+ }
+ 
++/// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/wcstof.html>.
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn wcstof(ptr: *const wchar_t, end: *mut *mut wchar_t) -> crate::platform::types::c_float {
++    unsafe { wcstod(ptr, end) as crate::platform::types::c_float }
++}
++
+ /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/wcstod.html>.
+ #[unsafe(no_mangle)]
+ pub unsafe extern "C" fn wcstod(mut ptr: *const wchar_t, end: *mut *mut wchar_t) -> c_double {
+diff --git a/src/ld_so/tcb.rs b/src/ld_so/tcb.rs
+index c64a8037..ed1c4fd9 100644
+--- a/src/ld_so/tcb.rs
++++ b/src/ld_so/tcb.rs
+@@ -99,7 +99,7 @@ impl Tcb {
+                 pthread: Pthread {
+                     waitval: Waitval::new(),
+                     flags: Default::default(),
+-                    has_enabled_cancelation: AtomicBool::new(false),
++                    has_enabled_cancelation: AtomicBool::new(true), // POSIX: PTHREAD_CANCEL_ENABLE by default
+                     has_queued_cancelation: AtomicBool::new(false),
+                     stack_base: core::ptr::null_mut(),
+                     stack_size: 0,
+diff --git a/src/pthread/mod.rs b/src/pthread/mod.rs
+index 00649115..6760fe07 100644
+--- a/src/pthread/mod.rs
++++ b/src/pthread/mod.rs
+@@ -35,7 +35,7 @@ pub unsafe fn init() {
+ 
+     let thread = Pthread {
+         waitval: Waitval::new(),
+-        has_enabled_cancelation: AtomicBool::new(false),
++        has_enabled_cancelation: AtomicBool::new(true), // POSIX: PTHREAD_CANCEL_ENABLE by default
+         has_queued_cancelation: AtomicBool::new(false),
+         flags: PthreadFlags::empty().bits().into(),
+ 
+@@ -61,8 +61,13 @@ pub unsafe fn init() {
+ //const FIRST_THREAD_IDX: usize = 1;
+ 
+ pub unsafe fn terminate_from_main_thread() {
++    // exit() may come from any thread, which must not cancel itself
++    let me = current_thread().map(|t| core::ptr::from_ref(t));
+     for tcb in OS_TID_TO_PTHREAD.lock().values() {
+-        let _ = unsafe { cancel(&(*tcb.0).pthread) };
++        let thread = unsafe { &(*tcb.0).pthread };
++        if Some(core::ptr::from_ref(thread)) != me {
++            let _ = unsafe { cancel(thread) };
++        }
+     }
+ }
+ 
+diff --git a/src/sync/semaphore.rs b/src/sync/semaphore.rs
+index 37fc502c..648fb586 100644
+--- a/src/sync/semaphore.rs
++++ b/src/sync/semaphore.rs
+@@ -68,10 +68,17 @@ impl Semaphore {
+                     CLOCK_REALTIME => timespec_realtime_to_monotonic(timeout)?,
+                     _ => return Err(Errno(errno::EINVAL)),
+                 };
+-                unsafe { Sys::futex_wait(self.count.ptr(), 0, Some(&relative))? };
++                match unsafe { Sys::futex_wait(self.count.ptr(), 0, Some(&relative)) } {
++                    // the count changed before the wait, or a signal: try again
++                    Ok(()) | Err(Errno(errno::EAGAIN)) | Err(Errno(errno::EINTR)) => {}
++                    Err(err) => return Err(err),
++                }
+             } else {
+                 // Use futex to wait for the next change, without a timeout
+-                unsafe { Sys::futex_wait(self.count.ptr(), 0, None)? };
++                match unsafe { Sys::futex_wait(self.count.ptr(), 0, None) } {
++                    Ok(()) | Err(Errno(errno::EAGAIN)) | Err(Errno(errno::EINTR)) => {}
++                    Err(err) => return Err(err),
++                }
+             }
+         }
+     }
+diff --git a/tests/net/if.c b/tests/net/if.c
+index 5cce1465..6ac7f319 100644
+--- a/tests/net/if.c
++++ b/tests/net/if.c
+@@ -32,11 +32,13 @@ int main(void) {
+   idx = if_nametoindex("stub");
+   assert_eq(idx, 1);
+ 
+-  const char *name;
+-  name = if_indextoname(0, 0);
++  char buf[IF_NAMESIZE];
++  char *name;
++  name = if_indextoname(0, buf);
+   assert_eq(name, 0);
+ 
+-  name = if_indextoname(1, 0);
++  name = if_indextoname(1, buf);
++  assert_eq(name, buf);
+   assert_eq(strcmp(name, "stub"), 0);
+ 
+   printf("OK\n");

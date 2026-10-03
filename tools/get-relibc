@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+#
+# Get relibc for Genode: clone upstream relibc at the commit the patches
+# are made for (patches/relibc.commit), with its submodules, apply
+# patches/relibc-fixes.patch and patches/relibc-genode.patch, and copy the
+# Genode platform module (relibc/src/platform/genode of this repository)
+# into it.
+#
+#   tools/get-relibc [DIR]      DIR defaults to $RELIBC_DIR, else ../relibc (beside this repository)
+#
+# Run again after this repository changed: on a checkout with the patches
+# applied it only copies the platform module anew. It never discards
+# changes of the checkout (tools/save-relibc keeps them).
+#
+set -e
+here=$(cd "$(dirname "$0")/.." && pwd)
+dir=${1:-${RELIBC_DIR:-$here/../relibc}}
+url=${RELIBC_URL:-https://gitlab.redox-os.org/redox-os/relibc.git}
+rev=$(cat "$here/patches/relibc.commit")
+patches=("$here/patches/relibc-fixes.patch" "$here/patches/relibc-genode.patch")
+
+if [ ! -d "$dir/.git" ]; then
+	git clone "$url" "$dir"
+fi
+cd "$dir"
+
+applied() { git apply --reverse --check "${patches[@]}" 2>/dev/null; }
+if [ "$(git rev-parse HEAD)" = "$rev" ] && applied; then
+	echo "patches already applied"
+else
+	if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
+		echo "error: $dir has changes that are not this repository's patches" >&2
+		echo "       (tools/save-relibc keeps them, git -C $dir stash drops them)" >&2
+		exit 1
+	fi
+	git cat-file -e "$rev^{commit}" 2>/dev/null || git fetch origin
+	git -c advice.detachedHead=false checkout "$rev"
+	git submodule update --init --recursive
+	git apply "${patches[@]}"
+	echo "applied: ${patches[*]##*/}"
+fi
+
+# the platform module, as this repository has it
+rm -rf src/platform/genode
+cp -r "$here/relibc/src/platform/genode" src/platform/genode
+echo "copied src/platform/genode"
+echo "relibc for Genode: $dir (next: tools/build-relibc)"

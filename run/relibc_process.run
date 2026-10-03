@@ -1,0 +1,66 @@
+#
+# Processes on relibc (the drop-in libc, a build directory with relibc as
+# libc): posix_spawn, fork, execve, waitpid, SIGCHLD. The children share
+# /tmp through a VFS server.
+#
+
+build { core lib/ld init timer lib/libc lib/libm lib/posix lib/vfs server/vfs test/relibc_process }
+
+create_boot_directory
+
+install_config {
+config
++ parent-provides
+  + service ROM
+  + service PD
+  + service RM
+  + service CPU
+  + service LOG
++ default-route
+  + any-service
+    + parent
+    + any-child
++ default | caps: 100 | ram: 1M
++ start timer
+  + provides | + service Timer
++ start vfs | ram: 4M
+  + provides | + service File_system
+  + config
+    + vfs | + ram
+    + default-policy | root: / | writeable: yes
++ start relibc_process | caps: 1000 | ram: 64M
+  + config
+  | + libc | stdin: /null | stdout: /log | stderr: /log
+  | + vfs
+  |   + null
+  |   + log
+  |   + dir tmp | + fs
+  |   + rom relibc_process
+  + route
+    + service ROM | label: /relibc_process | + parent | label: relibc_process
+    + any-service
+      + parent
+      + any-child
+-
+}
+
+build_boot_image [build_artifacts]
+
+append qemu_args " -nographic "
+
+run_genode_until {child "relibc_process" exited with exit value} 60
+
+grep_output {relibc process:}
+compare_output_to {
+[init -> relibc_process] relibc process: posix_spawn: ok
+[init -> relibc_process] relibc process: posix_spawn: waitpid, exit code: ok
+[init -> relibc_process] relibc process: the spawned child wrote 'hello from 2 in /tmp'
+[init -> relibc_process] relibc process: posix_spawn: args, env, fd, cwd: ok
+[init -> relibc_process] relibc process: posix_spawn: ENOENT: ok
+[init -> relibc_process] relibc process: fork: ok
+[init -> relibc_process] relibc process: fork and execve: exit code: ok
+[init -> relibc_process] relibc process: SIGCHLD: ok
+[init -> relibc_process] relibc process: fork: _exit code: ok
+[init -> relibc_process] relibc process: waitpid: ECHILD: ok
+[init -> relibc_process] relibc process: all checks passed
+}

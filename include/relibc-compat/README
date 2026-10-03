@@ -1,0 +1,4 @@
+Headers in front of relibc's for code written against Genode's
+FreeBSD-based libc: wrappers that include relibc's header and adjust it
+(#include_next), and FreeBSD headers that Genode's ports expect. Each says
+why it exists. lib/import/import-libc.mk puts this directory first.

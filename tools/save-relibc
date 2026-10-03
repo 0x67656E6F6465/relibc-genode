@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+#
+# Keep the changes made in a relibc checkout (tools/get-relibc) in this
+# repository: copy its src/platform/genode back to relibc/src/platform/genode,
+# and write its other changes, against the base commit with
+# patches/relibc-fixes.patch applied, to patches/relibc-genode.patch.
+#
+#   tools/save-relibc [DIR]      DIR defaults to $RELIBC_DIR, else ../relibc (beside this repository)
+#
+# relibc-fixes.patch (relibc fixes independent of Genode, for upstream)
+# stays as it is: a change that belongs there is made in that patch by
+# hand, followed by tools/get-relibc on a fresh checkout and this script.
+#
+set -e
+here=$(cd "$(dirname "$0")/.." && pwd)
+dir=$(cd "${1:-${RELIBC_DIR:-$here/../relibc}}" && pwd)
+rev=$(cat "$here/patches/relibc.commit")
+tmp=$(mktemp -d)
+trap 'git -C "$dir" worktree remove --force "$tmp/base" >/dev/null 2>&1; rm -rf "$tmp"' EXIT
+
+# the platform module
+rm -rf "$here/relibc/src/platform/genode"
+mkdir -p "$here/relibc/src/platform"
+cp -r "$dir/src/platform/genode" "$here/relibc/src/platform/genode"
+
+# the base with the fixes, then the checkout's other changed files on top
+git -C "$dir" worktree add --detach "$tmp/base" "$rev" >/dev/null
+cd "$tmp/base"
+git apply "$here/patches/relibc-fixes.patch"
+git add -A
+git -c user.name=save-relibc -c user.email=save-relibc@localhost commit -q -m "base and fixes"
+{
+	git -C "$dir" diff --name-only "$rev" -- . ':!openlibm' ':!dlmalloc-rs' ':!src/platform/genode'
+	git -C "$dir" ls-files --others --exclude-standard -- . ':!src/platform/genode'
+} | sort -u | while read -r f; do
+	if [ -e "$dir/$f" ]; then
+		mkdir -p "$(dirname "$f")"
+		cp "$dir/$f" "$f"
+	else
+		rm -f "$f"
+	fi
+done
+git add -A -N .
+git diff --no-color HEAD > "$here/patches/relibc-genode.patch"
+
+echo "saved: relibc/src/platform/genode, patches/relibc-genode.patch" \
+     "($(grep -c '^diff --git' "$here/patches/relibc-genode.patch") files)"

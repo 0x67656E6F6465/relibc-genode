@@ -1,0 +1,149 @@
+#
+# Download data via fetchurl (curl) from lighttpd over a virtual network,
+# both on relibc: Genode's ports/run/lighttpd_fetchurl.run, with every
+# component built in the build directory instead of taken from the depot
+# (whose binaries use Genode's libc). In a build directory that lists
+# relibc-genode first (genode/build/x86_64_relibc).
+#
+
+proc ip_stack      { } { return lwip }
+proc download_size { } { return "1M" }
+proc audit         { } { return 1 }
+
+build "core init timer lib/ld lib/vfs lib/libc lib/libm lib/posix
+       lib/vfs_[ip_stack] lib/vfs_audit lib/vfs_pipe
+       server/nic_router server/report_rom
+       app/lighttpd app/fetchurl
+       lib/curl lib/libssh lib/libcrypto lib/libssl lib/zlib lib/pcre"
+
+create_boot_directory
+
+proc socket_fs_plugin { } { return "[ip_stack] | dhcp: yes" }
+
+proc socket_path { } { if {[audit]} { return "/audit" } else { return "/socket" } }
+
+install_config {
+config
++ parent-provides
+  + service ROM
+  + service LOG
+  + service RM
+  + service CPU
+  + service PD
+  + service IRQ
+  + service IO_PORT
+  + service IO_MEM
+
++ default-route
+  + any-service
+    + parent
+    + any-child
+
++ default | caps: 150 | ram: 2M
+
++ start timer
+  + provides | + service Timer
+
++ start nic_router | caps: 200 | ram: 10M
+  + provides
+    + service Nic
+    + service Uplink
+  + config | verbose_domain_state: yes
+    + policy | label_prefix: lighttpd | domain: server
+    + policy | label_prefix: fetchurl | domain: client
+    + domain server | interface: 10.0.3.1/24
+      + dhcp-server | ip_first: 10.0.3.2 | ip_last:  10.0.3.2
+    + domain client | interface: 10.0.4.1/24
+      + dhcp-server | ip_first: 10.0.4.2 | ip_last: 10.0.4.2
+      + tcp | dst: 10.0.3.2/0 | + permit-any | domain: server
+
++ start lighttpd | caps: 200 | ram: 32M
+  + config
+  | + arg lighttpd
+  | + arg -f | : /etc/lighttpd/lighttpd.conf
+  | + arg -D
+  | + vfs
+  |   + dir dev
+  |   | + log
+  |   | + null
+  |   | + inline rtc    | : 2000-01-01 00:00
+  |   | + inline random | : 0123456789012345678901234567890123456789
+  |   + dir socket | + } [socket_fs_plugin] {
+  |   + dir audit  | + audit | path: socket
+  |   + dir etc
+  |   | + dir lighttpd
+  |   |   + inline lighttpd.conf
+  |   |     : server.port            = 80
+  |   |     : server.document-root   = "/website"
+  |   |     : server.event-handler   = "select"
+  |   |     : server.network-backend = "write"
+  |   |     : server.upload-dirs     = ( "/tmp" )
+  |   + dir website | + zero | size: } [download_size] {
+  |   + dir tmp     | + ram
+  | + libc | stdin: /dev/null | stdout: /dev/log    | stderr: /dev/log
+  |          rtc:   /dev/rtc  | rng:    /dev/random | socket: } [socket_path] {
+  + route
+    + service Nic | + child nic_router
+    + any-service
+      + parent
+      + any-child
+
++ start report_rom | caps: 100
+  + provides
+    + service Report
+    + service ROM
+  + config | verbose: yes
+
++ start fetchurl | caps: 500 | ram: 32M
+  + config
+    + report | delay_ms: 1000 | progress: yes
+    + vfs
+      + dir dev
+      | + log
+      | + null
+      | + inline rtc    | : 2000-01-01 00:00
+      | + inline random | : 0123456789012345678901234567890123456789
+      + dir socket | + } [socket_fs_plugin] {
+      + dir audit  | + audit | path: socket
+      + dir pipe   | + pipe
+    + libc | stdout: /dev/log    | stderr: /dev/log | rtc:    /dev/rtc
+             rng:    /dev/random | pipe: /pipe      | socket: } [socket_path] {
+    + fetch | url: http://10.0.3.2/zero | path: /dev/null | retry: 3
+-
+}
+
+build_boot_image [build_artifacts]
+
+append qemu_args " -nographic "
+
+run_genode_until {.*server started.*} 10
+
+set download_start_time [clock milliseconds]
+
+run_genode_until {.*"fetchurl" exited with exit value 0.*\n.*} 60 [output_spawn_id]
+
+set download_end_time [clock milliseconds]
+
+set download_duration_ms [expr ($download_end_time - $download_start_time)]
+
+puts "\ntransferred [download_size] in $download_duration_ms ms"
+
+if {[audit]} {
+
+	# count switches between fetchurl and lighttpd based on the output of 'audit'
+	set previous_label   ""
+	set audit_messages   0
+	set context_switches 0
+	foreach line [split [strip_whitespace $output] "\n"] {
+		if {[regexp -- {(\[.*-> audit\]).*} $line match label]} {
+			incr audit_messages
+			if {$label != $previous_label} {
+				incr context_switches
+				set previous_label $label
+			}
+		}
+	}
+
+	puts "\n$audit_messages audit messages"
+	puts "\n$context_switches context switches between fetchurl and lighttpd"
+}
